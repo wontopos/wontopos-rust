@@ -1,6 +1,6 @@
 [package]
 name = "wontopos"
-version = "2.2.37"
+version = "2.2.38"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."

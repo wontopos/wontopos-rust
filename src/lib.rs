@@ -426,7 +426,8 @@ pub struct SearchOpts {
     /// Needs a re-ask-capable model. An older one REFUSES the call (403) rather than
     /// charging for passes that never happened.
     pub verify: Option<u8>,
-    /// How many image memories the answer may carry, 0–5 (default 1). `Some(0)` asks for
+    /// How many image memories the answer may carry, 0–5. `None` lets the service use
+    /// 1; the MCP server defaults its own tool to 0 instead. `Some(0)` asks for
     /// none. Out of range is refused, not clamped — quietly cutting 5 to 1 would leave
     /// you believing you got five.
     ///
@@ -687,6 +688,12 @@ fn warn_if_plain_http(base_url: &str) {
     if !matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") {
         eprintln!("wontopos: base_url uses plain HTTP on a non-local host, so the API key travels unencrypted. Use https://.");
     }
+}
+
+/// An instant far enough out that nothing waits for it — what a deadline past the
+/// clock's range means in practice.
+fn far_future() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(60 * 60 * 24 * 365)
 }
 
 /// Seconds to sleep before retry `attempt` (0-based). Honors `Retry-After`.
@@ -988,7 +995,13 @@ impl Client {
     /// Where this call's budget runs out. Computed ONCE per call, never per attempt —
     /// a budget recomputed each attempt is the per-attempt timeout under another name.
     fn deadline_at(&self) -> Option<std::time::Instant> {
-        self.deadline.map(|d| std::time::Instant::now() + d)
+        // `Instant + Duration` PANICS on overflow, so `with_deadline(Duration::MAX)` —
+        // a natural spelling of "no budget", since ZERO already means that — built fine
+        // and then aborted the caller's task on every call, from inside the SDK, where
+        // every other failure is a Result. Saturate: a budget past the clock's range is
+        // a budget that never runs out.
+        self.deadline
+            .map(|d| std::time::Instant::now().checked_add(d).unwrap_or_else(far_future))
     }
 
     /// How long THIS attempt may take: the per-attempt timeout, or what is left of the
@@ -1062,6 +1075,18 @@ impl Client {
             Some(u) => u.to_string(),
             None => self.default_user.clone(),
         };
+        // The guard above only sees a PASSED id, so `with_user("")` walked around it:
+        // the blank landed in `default_user` and every later call resolved to it. The
+        // builder cannot return an error (it returns Self), so the check belongs here,
+        // on the RESOLVED id — which is the value that decides the destination anyway.
+        if sid.trim().is_empty() {
+            return Err(WosError::Api {
+                status: 400,
+                message: "this client's default store is blank — with_user(\"\") leaves it that way. \
+                          Pass a real store id, or build the client without with_user to use `default`."
+                    .into(),
+            });
+        }
         warn_if_store_id_collapses(&sid);
         Ok(sid)
     }
@@ -1215,6 +1240,11 @@ impl Client {
 
     /// Search stored memories. Returns them most relevant first.
     ///
+    /// `limit` is 5..=20, and out of range is refused rather than clamped: asking for
+    /// 50 and silently receiving 20 reads as "that is all there is". Before 2.2.35 the
+    /// count was sent on unchecked, and a 0 was rewritten to 10 here in the client —
+    /// so a budget that computed zero was answered with ten memories, and billed.
+    ///
     /// `limit` bounds `memories`, not the returned `Vec`. On a model that keeps the
     /// assistant's own words separate (Scroll 1.2+) those come back as well, so the
     /// `Vec` can hold
@@ -1366,7 +1396,7 @@ impl Client {
             memories: memories_from(v.get("memories")),
             self_memories: memories_from(v.get("self_memories")),
             images: memories_from(v.get("images")),
-            verify_used: v.get("verify_used").and_then(|n| n.as_u64()).map(|n| n as u8),
+            verify_used: v.get("verify_used").and_then(|n| n.as_u64()).map(|n| u8::try_from(n).unwrap_or(u8::MAX)),
             raw: v,
         })
     }
@@ -1544,7 +1574,13 @@ impl Client {
         }
         let user_id = self.uid(user_id.into())?;
         let v = self
-            .post("/api/v1/memory/get", serde_json::json!({"user_id": user_id, "memory_id": memory_id}))
+            .post(
+                "/api/v1/memory/get",
+                // Validated by trimming, so send the trimmed form. Python strips before
+                // sending; an id pasted from a log with a stray space came back in one
+                // client and 404'd in the others, on a surface advertised as identical.
+                serde_json::json!({"user_id": user_id, "memory_id": memory_id.trim()}),
+            )
             .await?;
         Ok(v.get("memory").cloned().unwrap_or_else(|| serde_json::json!({})))
     }
@@ -1904,10 +1940,16 @@ truncated answer, not the whole store."
         user_id: impl Into<Option<&str>>,
         memory_id: &str,
     ) -> Result<serde_json::Value, WosError> {
+        if memory_id.trim().is_empty() {
+            return Err(WosError::Api {
+                status: 400,
+                message: "memory_id is required — the id that add/store or list_memories returned.".into(),
+            });
+        }
         let user_id = self.uid(user_id.into())?;
         self.post(
             "/api/v1/memory/lineage",
-            serde_json::json!({ "user_id": user_id, "memory_id": memory_id }),
+            serde_json::json!({ "user_id": user_id, "memory_id": memory_id.trim() }),
         )
         .await
     }
@@ -2110,15 +2152,6 @@ truncated answer, not the whole store."
 
     // ----- internal -----
 
-    /// One request that answers with BYTES rather than JSON.
-    ///
-    /// Only `/memory/image` does this, and it is why it cannot go through `request`:
-    /// that path parses the body as JSON and errors on anything else, so a JPEG would
-    /// surface as a parse failure on a call that actually succeeded.
-    ///
-    /// Errors still arrive as JSON, so a non-2xx is decoded the same way as everywhere
-    /// else and keeps `NotFound` / auth failures behaving identically. No retries: this
-    /// is a read, but the body can be megabytes and a blind retry would pay for it twice.
     /// The key checks, in one place both request paths reach.
     ///
     /// They used to live inside `request_with_key`, which `request_bytes` does not go
@@ -2139,6 +2172,18 @@ truncated answer, not the whole store."
                 message: "api_key contains a control character - check for a paste error".into(),
             });
         }
+        // Keys are ASCII by construction. A key pasted from a rich-text doc, Slack or a
+        // PDF has had its hyphen turned into an en dash, which then fails at the network
+        // as the same mystery 401. Python refuses it by name; this client did not.
+        if let Some(bad) = self.api_key.chars().find(|c| !c.is_ascii()) {
+            return Err(WosError::Api {
+                status: 400,
+                message: format!(
+                    "api_key contains a non-ASCII character ({bad:?}) - rich text turns '-' into an \
+                     en dash; copy the key from a plain-text field"
+                ),
+            });
+        }
         if self.api_key.chars().any(|c| c.is_whitespace()) {
             return Err(WosError::Api {
                 status: 400,
@@ -2148,6 +2193,18 @@ truncated answer, not the whole store."
         Ok(())
     }
 
+    /// One request that answers with BYTES rather than JSON.
+    ///
+    /// Only `/memory/image` does this, and it is why it cannot go through `request`:
+    /// that path parses the body as JSON and errors on anything else, so a JPEG would
+    /// surface as a parse failure on a call that actually succeeded.
+    ///
+    /// Errors still arrive as JSON, so a non-2xx is decoded the same way as everywhere
+    /// else and keeps `NotFound` / auth failures behaving identically.
+    ///
+    /// Retries 429 and connect-level failures, like every other call. A retry AFTER
+    /// bytes have arrived would pay for the body twice; neither of these is that —
+    /// a 429 carries no image, and a connect failure never reached the server.
     async fn request_bytes(
         &self,
         path: &str,
@@ -2155,16 +2212,59 @@ truncated answer, not the whole store."
     ) -> Result<(Vec<u8>, String), WosError> {
         self.check_api_key()?;
         let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .http
-            .post(&url)
-            .header("X-API-Key", &self.api_key)
-            .header("X-WOS-Model", &self.model)
-            .json(body)
-            .timeout(self.attempt_budget(self.deadline_at())?)
-            .send()
-            .await
-            .map_err(WosError::Network)?;
+        let attempts = self.retries.saturating_add(1);
+        let deadline_at = self.deadline_at();
+        let mut attempt: u32 = 0;
+        let resp = loop {
+            let sent = self
+                .http
+                .post(&url)
+                .header("X-API-Key", &self.api_key)
+                .header("X-WOS-Model", &self.model)
+                .json(body)
+                .timeout(self.attempt_budget(deadline_at)?)
+                .send()
+                .await;
+            let r = match sent {
+                Ok(r) => r,
+                Err(e) => {
+                    // A connect-level failure never reached the server, so re-sending
+                    // cannot double-anything — and that includes a CONNECT timeout, which
+                    // reqwest reports with both predicates true. Excluding every timeout
+                    // here dropped exactly the case the JSON path retries. The ambiguous
+                    // one is a timeout AFTER the request went out, and that arrives as
+                    // is_timeout() without is_connect().
+                    if e.is_connect() && attempt + 1 < attempts {
+                        let delay = backoff(attempt, None);
+                        tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(WosError::Network(e));
+                }
+            };
+            // 429 carries no image and is refused before any processing, so retrying it
+            // is always safe. This route had no loop at all while the module doc promised
+            // "every call retries transient failures … 429 always" — measured in the
+            // TypeScript client with maxRetries 4 against a 429 server: stats() sent five
+            // requests, getImage() sent one. Both siblings fixed it; this one had not.
+            if r.status().as_u16() == 429 && attempt + 1 < attempts {
+                let ra = r.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
+                let delay = backoff(attempt, ra.as_deref());
+                tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
+                attempt += 1;
+                continue;
+            }
+            break r;
+        };
+        // The quota this call just spent. rate_limit() promises the MOST RECENT call and
+        // this route never wrote to it, so an image loop self-throttling on it read a
+        // snapshot frozen at whatever JSON call came before — or None forever.
+        if let Some(rl) = parse_rate_limit(resp.headers()) {
+            if let Ok(mut g) = self.rl.lock() {
+                *g = Some(rl);
+            }
+        }
         let status = resp.status();
         if status.is_redirection() {
             return Err(WosError::Api {
@@ -2263,7 +2363,10 @@ truncated answer, not the whole store."
         // `is_whitespace` is false for "", so this had to be its own check.
         self.check_api_key()?;
         let url = format!("{}{}", self.base_url, path);
-        let attempts = self.retries + 1;
+        // `+ 1` overflowed for with_retries(u32::MAX): debug panicked, release wrapped to
+        // 0, and `attempt + 1 < attempts` was then never true — "retry as hard as you can"
+        // silently became "do not retry".
+        let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
         let mut attempt: u32 = 0;
         loop {
@@ -2488,6 +2591,61 @@ mod store_resolution_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `Instant + Duration` panics on overflow, so a deadline past the clock's range
+    /// aborted the caller's task from inside the SDK on every call.
+    #[test]
+    fn a_deadline_past_the_clocks_range_does_not_panic() {
+        for d in [
+            std::time::Duration::MAX,
+            std::time::Duration::from_secs(u64::MAX / 2),
+            std::time::Duration::from_secs(u64::MAX),
+        ] {
+            let c = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_deadline(d);
+            let at = c.deadline_at().expect("a non-zero deadline is Some");
+            assert!(at > std::time::Instant::now(), "{d:?} must resolve to a future instant");
+            assert!(c.attempt_budget(Some(at)).is_ok(), "{d:?} must leave a usable budget");
+        }
+        // ZERO still means "no budget", and an ordinary one still bounds the call.
+        assert!(Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk")
+            .with_deadline(std::time::Duration::ZERO)
+            .deadline_at()
+            .is_none());
+    }
+
+    /// `retries + 1` wrapped to 0 in release, and `attempt + 1 < attempts` was then never
+    /// true — "retry as hard as you can" became "do not retry".
+    #[test]
+    fn the_largest_retry_count_still_retries() {
+        let c = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_retries(u32::MAX);
+        assert_eq!(c.retries.saturating_add(1), u32::MAX, "attempts must not wrap to 0");
+    }
+
+    /// with_user("") used to leave a blank default on the client, and every later call
+    /// resolved to it — the builder walking around the guard the per-call path applies.
+    #[test]
+    fn with_user_blank_cannot_silently_become_the_default_store() {
+        let bound = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_user("tenant-a");
+        assert_eq!(bound.uid(None).unwrap(), "tenant-a");
+        assert_eq!(bound.uid(Some("tenant-b")).unwrap(), "tenant-b");
+
+        for blank in ["", " ", "\t", "\n"] {
+            let c = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_user(blank);
+            let err = c.uid(None).unwrap_err();
+            assert!(
+                format!("{err}").contains("default store is blank"),
+                "with_user({blank:?}) must not resolve to a store: {err}"
+            );
+            // The per-call form was already guarded; it must stay guarded.
+            assert!(c.uid(Some(blank)).is_err(), "uid(Some({blank:?}))");
+        }
+
+        // The zero-setup path still works.
+        assert_eq!(
+            Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").uid(None).unwrap(),
+            "default"
+        );
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2671,14 +2829,18 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn image_calls_require_a_memory_id() {
-        // `get` and `delete` refused a blank id; the two image calls sent it and let
-        // the server answer, which costs a round trip to learn the caller's own bug.
+        // `get` and `delete` refused a blank id; the others sent it and let the server
+        // answer, which costs a round trip to learn the caller's own bug. `lineage` was
+        // given the trim without the check, so it posted memory_id:"" while Python and
+        // TypeScript raised locally — one surface answering the same call three ways.
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9");
         for r in [
             mem.get_image("alice", "").await.err(),
             mem.get_image("alice", "   ").await.err(),
             mem.forget_image("alice", "", false).await.err(),
             mem.forget_image("alice", "  ", true).await.err(),
+            mem.lineage("alice", "").await.err(),
+            mem.lineage("alice", "   ").await.err(),
         ] {
             match r {
                 Some(WosError::Api { status, message }) => {
