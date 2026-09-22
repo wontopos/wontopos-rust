@@ -20,7 +20,7 @@
 //! and searching call no LLM.
 //!
 //! Reliability: every call retries transient failures with exponential backoff
-//! and jitter, honoring `Retry-After` — 429 always; 502/503 and network errors
+//! and jitter, honoring `Retry-After` — 429 always; 408/502/503/504 and network errors
 //! only when a retry can never double-process a write (idempotent calls, or a
 //! failure at connect time). Timeouts are never retried: the write may have
 //! landed, and re-sending would bill it twice.
@@ -262,8 +262,8 @@ pub enum ErrorKind {
     RateLimited,
     /// 5xx — server failure.
     ///
-    /// `502` / `503` are transient: this client already retries them where a retry
-    /// cannot double-process a write. `501` is NOT — it means the engine behind the
+    /// `502` / `503` / `504` are transient: this client already retries them where a
+    /// retry cannot double-process a write. `501` is NOT — it means the engine behind the
     /// selected model does not implement that endpoint at all, so retrying can never
     /// succeed. Pick a model that supports it ([`Client::list_models`]) instead.
     Server,
@@ -284,6 +284,10 @@ impl WosError {
         match self {
             WosError::Network(_) => ErrorKind::Connection,
             WosError::Api { status, .. } => match status {
+                // An exhausted deadline, and only that: no response arrived. The 64MB
+                // cap carries the response's own status and the page-walk ceiling
+                // carries 200, so neither lands here. Every caller mistake is 400.
+                0 => ErrorKind::Connection,
                 400 => ErrorKind::BadRequest,
                 401 => ErrorKind::Auth,
                 402 => ErrorKind::PaymentRequired,
@@ -330,26 +334,26 @@ fn parse_rate_limit(h: &reqwest::header::HeaderMap) -> Option<RateLimit> {
     }
 }
 
-/// Deserialize a scalar the server *should* always send, but tolerate an explicit
-/// `null` (or an absent key) by falling back to the type's default. `#[serde(default)]`
-/// alone only covers a MISSING key — a present `null` on a non-`Option` field
-/// (`"content": null`, `"similarity": null`) is an "invalid type: null" hard error
-/// that fails the WHOLE `search`/`list` batch, dropping every good memory alongside
-/// the one odd element. The Python (raw dict) and TS (structural cast) SDKs pass such
-/// responses through; this keeps the strongly-typed Rust SDK at the same tolerance.
+/// Deserialize a field the server should always send, falling back to the type's
+/// default when it is `null` or will not convert, so one odd field does not cost the
+/// caller the whole record.
 fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de> + Default,
+    T: serde::de::DeserializeOwned + Default,
 {
-    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+    let v = serde_json::Value::deserialize(d)?;
+    if v.is_null() {
+        return Ok(T::default());
+    }
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 /// One retrieved memory. Known fields are typed; everything else (e.g. `speaker`:
 /// `"me"` for the assistant's own words, or a person's name) lands in `extra`.
 #[derive(Debug, Deserialize)]
 pub struct Memory {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: Option<String>,
     #[serde(default, deserialize_with = "null_to_default")]
     pub content: String,
@@ -366,38 +370,42 @@ pub struct Memory {
     #[serde(default, deserialize_with = "null_to_default")]
     pub importance: f64,
     /// Month bucket, e.g. "2026-07". Absent when temporal fields are stripped.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub time_bucket: Option<String>,
     /// True if a later memory has superseded this one.
     #[serde(default, deserialize_with = "null_to_default")]
     pub is_superseded: bool,
     /// Id of the memory that superseded this one, if any.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub superseded_by: Option<String>,
     /// When the memory was stored (RFC3339). Absent when temporal fields are stripped.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub created_at: Option<String>,
     /// When the content actually happened (RFC3339), if known.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub event_date: Option<String>,
     /// WHO said it: `"me"` for the agent's own words, or a registered person's name.
     /// `None` when the memory carries no speaker tag. Every search result carries this
     /// (the docs say so), so it is a named field rather than something to dig for
     /// under `extra`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub speaker: Option<String>,
     /// The memory's time written in the requested delivery form — `"a couple weeks
     /// ago"` (memoir) or `"2 weeks ago (Jun 09)"` (archive). Present only when the
     /// call asked for a form on a form-capable model. Same story as `speaker`: it
     /// arrived, but only in `extra`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub time: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One-call LLM context: short-term turns + long-term matches + surrounding context.
+///
+/// Fields this struct does not name land in `extra`. It is `#[non_exhaustive]`:
+/// destructure with a trailing `..` and build one with `serde_json::from_value`.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct RecallResponse {
     #[serde(default)]
     pub short_term: serde_json::Value,
@@ -405,6 +413,9 @@ pub struct RecallResponse {
     pub long_term: serde_json::Value,
     #[serde(default)]
     pub context: serde_json::Value,
+    /// Every other field of the reply, as it arrived.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Per-call search options with a fixed shape — see [`Client::search_opts`].
@@ -565,7 +576,7 @@ fn check_context_limit(n: usize) -> Result<(), WosError> {
     // usize, and a guard half of which is dead is a guard nobody can read.
     if !(CONTEXT_LIMIT_MIN..=CONTEXT_LIMIT_MAX).contains(&n) {
         return Err(WosError::Api {
-            status: 0,
+            status: 400,
             message: format!(
                 "context_limit must be between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}."
             ),
@@ -577,7 +588,7 @@ fn check_context_limit(n: usize) -> Result<(), WosError> {
 fn check_search_limit(limit: usize) -> Result<(), WosError> {
     if !(SEARCH_LIMIT_MIN..=SEARCH_LIMIT_MAX).contains(&limit) {
         return Err(WosError::Api {
-            status: 0,
+            status: 400,
             message: format!(
                 "limit must be between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. \
                  Out of range is refused rather than adjusted, so a short answer always \
@@ -642,10 +653,13 @@ async fn read_capped(resp: reqwest::Response) -> Result<String, WosError> {
 /// the JSON paths were guarded while the one path that returns megabytes was not. One
 /// implementation, two callers, so the two cannot drift apart.
 async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>, WosError> {
+    // The response's own status, not 0: a body did arrive. 0 means nothing came back
+    // and reads as `ErrorKind::Connection`, which callers retry.
+    let http = resp.status().as_u16();
     if let Some(cl) = resp.content_length() {
         if cl as usize > MAX_RESPONSE_BYTES {
             return Err(WosError::Api {
-                status: 0,
+                status: http,
                 message: format!("response too large ({cl} bytes) — refusing to buffer it"),
             });
         }
@@ -657,7 +671,7 @@ async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>, WosError>
         let chunk = chunk.map_err(WosError::Network)?;
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(WosError::Api {
-                status: 0,
+                status: http,
                 message: "response too large — refusing to buffer it".into(),
             });
         }
@@ -677,8 +691,7 @@ fn warn_if_plain_http(base_url: &str) {
     // Strip userinfo FIRST. `http://127.0.0.1:9@evil.example` has authority
     // "127.0.0.1:9@evil.example"; splitting on ':' first yields "127.0.0.1", so this
     // check called it loopback and said nothing while the key travelled in cleartext to
-    // evil.example. The host is what follows the LAST '@'. (Python's urlsplit already
-    // did this correctly; TypeScript and Rust were the copies that did not.)
+    // evil.example. The host is what follows the LAST '@'.
     let hostport = authority.rsplit('@').next().unwrap_or("");
     let host = if let Some(v6) = hostport.strip_prefix('[') {
         v6.split(']').next().unwrap_or("")
@@ -694,6 +707,15 @@ fn warn_if_plain_http(base_url: &str) {
 /// clock's range means in practice.
 fn far_future() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60 * 60 * 24 * 365)
+}
+
+/// Whether a status may be sent again, given whether the method can be replayed.
+/// 429 is refused before the request is processed, so nothing was written and any
+/// method may retry. The rest are ambiguous for a write: 408, 502, 503 and 504 can
+/// arrive after the write already landed, and a retried POST would store it twice.
+/// Those retry only when the method is idempotent.
+fn status_is_retryable(status: u16, idempotent: bool) -> bool {
+    status == 429 || (matches!(status, 408 | 502 | 503 | 504) && idempotent)
 }
 
 /// Seconds to sleep before retry `attempt` (0-based). Honors `Retry-After`.
@@ -920,7 +942,7 @@ impl Client {
             }
         }
         Err(WosError::Api {
-            status: 0,
+            status: 400,
             message: format!("set {} (or {}) in the environment", ENV_KEYS[0], ENV_KEYS[1]),
         })
     }
@@ -1036,7 +1058,7 @@ impl Client {
         c
     }
 
-    /// Return a client that retries transient failures (429/502/503 and connect
+    /// Return a client that retries transient failures (429/408/502/503/504 and connect
     /// errors) `retries` times before giving up. 0 disables retries (default 2).
     pub fn with_retries(&self, retries: u32) -> Self {
         let mut c = self.clone_with(None, None);
@@ -1057,9 +1079,7 @@ impl Client {
         // another end-user's store and stay readable there. The warning it printed goes
         // to stderr, which a server process usually discards.
         //
-        // Every method here already returns Result, so reject it the way the TypeScript
-        // and Python clients do — the three surfaces are advertised as identical, and a
-        // destination that differs by language is the worst kind of difference.
+        // Every method here already returns Result, so reject it here.
         if matches!(user_id, Some(u) if u.trim().is_empty()) {
             return Err(WosError::Api {
                 status: 400,
@@ -1145,7 +1165,9 @@ impl Client {
     /// as a string, never fetched by us), and `taken_at` (RFC3339, usually from EXIF)
     /// fills `event_date` when that is empty, so the memory sorts by when the image
     /// was TAKEN rather than by when it was uploaded. `image.data` is normalised on the
-    /// way through — see [`normalize_image_b64`].
+    /// way through: a `data:...;base64,` prefix is dropped and all whitespace, including
+    /// the newlines a wrapped base64 file carries, is removed. Nothing else is changed —
+    /// URL-safe base64 is not converted, so send the standard alphabet.
     ///
     /// What the service keeps is NOT your original. Over 1568px on the long edge the
     /// picture is downscaled to 1568 on the way in, and downscaling means re-encoding:
@@ -1154,6 +1176,34 @@ impl Client {
     /// memory engine, not a photo host — keep the full-resolution file yourself and put
     /// its URL in `reference`.
     pub async fn add_with(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value, extra: serde_json::Value) -> Result<serde_json::Value, WosError> {
+        self.store_one(content, user_id, metadata, extra, None).await
+    }
+
+    /// [`Client::add_with`] and [`Client::add_idempotent`] in one call: carry an image
+    /// AND make re-running the write safe.
+    pub async fn add_with_idempotent(
+        &self,
+        content: &str,
+        user_id: impl Into<Option<&str>>,
+        metadata: serde_json::Value,
+        extra: serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value, WosError> {
+        self.store_one(content, user_id, metadata, extra, Some(idempotency_key)).await
+    }
+
+    /// The body builder behind [`Client::add_with`], [`Client::add_with_idempotent`]
+    /// and [`Client::add_idempotent`], which passes no `extra`. `extra` goes in first
+    /// and reserved fields after, so forwarded JSON cannot point the write at another
+    /// store.
+    async fn store_one(
+        &self,
+        content: &str,
+        user_id: impl Into<Option<&str>>,
+        metadata: serde_json::Value,
+        extra: serde_json::Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         let mut obj = serde_json::Map::new();
         if let Some(e) = extra.as_object() {
@@ -1167,7 +1217,8 @@ impl Client {
         obj.insert("user_id".into(), serde_json::json!(user_id));
         obj.insert("content".into(), serde_json::json!(content));
         obj.insert("metadata".into(), metadata);
-        self.post("/api/v1/memory/store", serde_json::Value::Object(obj)).await
+        self.post_idem("/api/v1/memory/store", serde_json::Value::Object(obj), idempotency_key)
+            .await
     }
 
     /// Store a conversation turn (user + assistant). Payload first, user_id last — same shape as `add`/`search`.
@@ -1177,10 +1228,79 @@ impl Client {
     }
 
     /// Bulk-ingest a large blob of text in one call.
+    ///
+    /// An empty `category` is sent as it is, and the service decides what to do with
+    /// it.
+    ///
+    /// To date the ingested memories, use [`Client::add_bulk_with`] — `add_bulk`
+    /// cannot take a `timestamp` and every memory would carry the upload time.
     pub async fn add_bulk(&self, content: &str, user_id: impl Into<Option<&str>>, category: &str) -> Result<serde_json::Value, WosError> {
+        self.add_bulk_with(content, user_id, category, serde_json::json!({})).await
+    }
+
+    /// [`Client::add_bulk`] plus extra body fields — `json!({"timestamp": "2024-03-01T10:00:00Z"})`
+    /// to date what is being backfilled.
+    ///
+    /// Backfilling is what bulk ingest is FOR, and dating it is what makes the result
+    /// usable: without a timestamp every memory carries the upload time, so the store
+    /// sorts wrong and an `event_from`/`event_to` search misses it. Rust has no keyword
+    /// arguments, so it arrives here, the same way `add_with` carries an image.
+    ///
+    /// A backfill usually wants a key as well — see
+    /// [`Client::add_bulk_with_idempotent`], which takes both.
+    pub async fn add_bulk_with(
+        &self,
+        content: &str,
+        user_id: impl Into<Option<&str>>,
+        category: &str,
+        extra: serde_json::Value,
+    ) -> Result<serde_json::Value, WosError> {
+        self.bulk(content, user_id, category, extra, None).await
+    }
+
+    /// [`Client::add_bulk_with`] and [`Client::add_bulk_idempotent`] in one call: date
+    /// the backfill AND make re-running it safe.
+    ///
+    /// A backfill is the call most worth a key, because a run that dies halfway and is
+    /// started again would otherwise ingest the whole blob a second time — and it is
+    /// also the call that has to carry a timestamp, or every memory is dated the day
+    /// the import ran.
+    pub async fn add_bulk_with_idempotent(
+        &self,
+        content: &str,
+        user_id: impl Into<Option<&str>>,
+        category: &str,
+        extra: serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value, WosError> {
+        self.bulk(content, user_id, category, extra, Some(idempotency_key)).await
+    }
+
+    /// The body builder behind all four `add_bulk*`. Written once because the ORDER
+    /// matters: `extra` first, reserved fields after, so a caller forwarding untrusted
+    /// JSON cannot point the write at another store. The single-memory route has the
+    /// same rule in [`Client::store_one`].
+    async fn bulk(
+        &self,
+        content: &str,
+        user_id: impl Into<Option<&str>>,
+        category: &str,
+        extra: serde_json::Value,
+        idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        let category = if category.is_empty() { "general" } else { category };
-        self.post("/api/v1/memory/bulk-store", serde_json::json!({"user_id": user_id, "content": content, "category": category})).await
+        let mut obj = serde_json::Map::new();
+        if let Some(e) = extra.as_object() {
+            for (k, v) in e {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        // Reserved fields last, so they win over anything `extra` tried to set.
+        obj.insert("user_id".into(), serde_json::json!(user_id));
+        obj.insert("content".into(), serde_json::json!(content));
+        obj.insert("category".into(), serde_json::json!(category));
+        self.post_idem("/api/v1/memory/bulk-store", serde_json::Value::Object(obj), idempotency_key)
+            .await
     }
 
     /// Supersede an old memory with new content. Payload first, user_id last — same shape as `add`/`search`.
@@ -1196,9 +1316,9 @@ impl Client {
     // arrives with a different body. Use it when the retry is YOURS — a job that died and
     // was re-run, a queue that redelivers. This client retries a write on exactly one
     // status: 429, which the service answers before it processes anything, so nothing was
-    // stored. It never retries a write on 502 / 503 or a dropped body, where the request
-    // may already have been stored and billed — without a key it cannot know whether that
-    // first attempt landed.
+    // stored. It never retries a write on 408 / 502 / 503 / 504 or a dropped body,
+    // where the first attempt may already have landed — without a key the client
+    // cannot know whether it did.
     //
     // The key must be UNIQUE PER LOGICAL WRITE — derive it from the thing being stored
     // (`format!("import:{}", row.id)`), never a constant, or the second write replays the
@@ -1212,8 +1332,7 @@ impl Client {
 
     /// [`Client::add`] with an idempotency key.
     pub async fn add_idempotent(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value, idempotency_key: &str) -> Result<serde_json::Value, WosError> {
-        let user_id = self.uid(user_id.into())?;
-        self.post_idem("/api/v1/memory/store", serde_json::json!({"user_id": user_id, "content": content, "metadata": metadata}), Some(idempotency_key)).await
+        self.store_one(content, user_id, metadata, serde_json::json!({}), Some(idempotency_key)).await
     }
 
     /// [`Client::add_turn`] with an idempotency key.
@@ -1223,11 +1342,10 @@ impl Client {
     }
 
     /// [`Client::add_bulk`] with an idempotency key. The call most worth one: a backfill
-    /// that dies halfway and is re-run would otherwise re-ingest and re-bill the whole blob.
+    /// that dies halfway and is re-run would otherwise ingest the whole blob a second time.
     pub async fn add_bulk_idempotent(&self, content: &str, user_id: impl Into<Option<&str>>, category: &str, idempotency_key: &str) -> Result<serde_json::Value, WosError> {
-        let user_id = self.uid(user_id.into())?;
-        let category = if category.is_empty() { "general" } else { category };
-        self.post_idem("/api/v1/memory/bulk-store", serde_json::json!({"user_id": user_id, "content": content, "category": category}), Some(idempotency_key)).await
+        // An empty category is sent as it is — see `add_bulk`.
+        self.bulk(content, user_id, category, serde_json::json!({}), Some(idempotency_key)).await
     }
 
     /// [`Client::update`] with an idempotency key.
@@ -1704,11 +1822,9 @@ impl Client {
     /// EVERY image memory in a store, paging under the hood. [`Client::list_images`] is
     /// the one-page primitive; this is the "give me all of them" convenience.
     ///
-    /// TypeScript and Python spell this `iterImages` / `iter_images` and hand pages back
-    /// lazily. Rust has no async generator in the stable language, and this crate already
-    /// answers the same question for text with [`Client::list_all_memories`], so it keeps
-    /// that shape: collect and return. Reach for `list_images` when a store is big enough
-    /// that holding every image row at once matters.
+    /// Rust has no async generator in the stable language, so this collects and
+    /// returns. Reach for `list_images` when a store is big enough that holding every
+    /// image row at once matters.
     ///
     /// This walks ROWS, not pixels — the bytes come from [`Client::get_image`] one at a
     /// time. A thousand images here is a thousand small JSON records, not a thousand JPEGs.
@@ -1775,8 +1891,10 @@ impl Client {
             skip_ids = next_skip;
         }
         if !ended {
+            // 200, not 0: every page answered. This is a local ceiling, not a
+            // failed connection.
             return Err(WosError::Api {
-                status: 0,
+                status: 200,
                 message: format!(
                     "stopped after {MAX_PAGES} pages — the store did not end. This is a \
 truncated answer, not the whole store."
@@ -1786,17 +1904,31 @@ truncated answer, not the whole store."
         Ok(out)
     }
 
-    /// Every image in a store — the cross-language name for [`Client::list_all_images`].
+    /// Every image memory in a store, as a list. The image-side pair of
+    /// [`Client::export_memories`].
     ///
-    /// Same reason [`Client::export_memories`] exists: the published docs advertise
-    /// `iter_images`, so a Rust reader following them hit a method that was not there.
-    /// It collects rather than streams — see [`Client::list_all_images`].
-    pub async fn iter_images(
+    /// It collects rather than streams, and so does every other name for it here:
+    /// Rust has no async generator in the stable language, so there is no
+    /// page-at-a-time form in this client. A store too large to hold at once has to
+    /// be walked with [`Client::list_images`], handing back BOTH cursors the previous
+    /// page returned — `before` and `skip_ids`. `before` alone repeats or skips images
+    /// that share a timestamp.
+    pub async fn export_images(
         &self,
         user_id: impl Into<Option<&str>>,
         page_size: impl Into<Option<usize>>,
     ) -> Result<Vec<serde_json::Value>, WosError> {
         self.list_all_images(user_id, page_size).await
+    }
+
+    /// Kept for callers written against it. Despite the name it returns a fully
+    /// buffered `Vec`. Use [`Client::export_images`].
+    pub async fn iter_images(
+        &self,
+        user_id: impl Into<Option<&str>>,
+        page_size: impl Into<Option<usize>>,
+    ) -> Result<Vec<serde_json::Value>, WosError> {
+        self.export_images(user_id, page_size).await
     }
 
     // ----- how much has this memory been edited -----
@@ -1848,7 +1980,7 @@ truncated answer, not the whole store."
     pub async fn usage(&self, days: u32) -> Result<serde_json::Value, WosError> {
         if !(1..=365).contains(&days) {
             return Err(WosError::Api {
-                status: 0,
+                status: 400,
                 message: format!("days must be between 1 and 365, got {days}."),
             });
         }
@@ -2028,8 +2160,10 @@ truncated answer, not the whole store."
             }
         }
         if !ended {
+            // 200, not 0: every page answered. This is a local ceiling, not a
+            // failed connection.
             return Err(WosError::Api {
-                status: 0,
+                status: 200,
                 message: format!(
                     "stopped after {MAX_PAGES} pages — the store did not end. This is a \
 truncated answer, not the whole store."
@@ -2174,7 +2308,7 @@ truncated answer, not the whole store."
         }
         // Keys are ASCII by construction. A key pasted from a rich-text doc, Slack or a
         // PDF has had its hyphen turned into an en dash, which then fails at the network
-        // as the same mystery 401. Python refuses it by name; this client did not.
+        // as the same mystery 401.
         if let Some(bad) = self.api_key.chars().find(|c| !c.is_ascii()) {
             return Err(WosError::Api {
                 status: 400,
@@ -2244,10 +2378,7 @@ truncated answer, not the whole store."
                 }
             };
             // 429 carries no image and is refused before any processing, so retrying it
-            // is always safe. This route had no loop at all while the module doc promised
-            // "every call retries transient failures … 429 always" — measured in the
-            // TypeScript client with maxRetries 4 against a 429 server: stats() sent five
-            // requests, getImage() sent one. Both siblings fixed it; this one had not.
+            // is always safe.
             if r.status().as_u16() == 429 && attempt + 1 < attempts {
                 let ra = r.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
                 let delay = backoff(attempt, ra.as_deref());
@@ -2394,12 +2525,6 @@ truncated answer, not the whole store."
                     //   · an idempotent method — re-running it changes nothing
                     // Timeouts are excluded from BOTH: they are ambiguous (the write may
                     // have landed), and re-sending would bill it twice.
-                    //
-                    // The idempotent half was missing here. A GET whose body dropped
-                    // mid-stream is not a connect error, so this client gave up where the
-                    // TypeScript and Python clients recovered — the three are advertised
-                    // as the same product with the same reliability, and a read that
-                    // survives a blip in two of them must not fail in the third.
                     let safe = e.is_connect() || (method.is_idempotent() && !e.is_timeout());
                     if safe && attempt + 1 < attempts {
                         let delay = backoff(attempt, None);
@@ -2417,12 +2542,7 @@ truncated answer, not the whole store."
                 }
             };
             let status = resp.status();
-            // 429 = rate-limited before processing → always safe. 502/503 are
-            // ambiguous for a write (may be returned AFTER the backend processed +
-            // billed it), so retry those only for idempotent methods — a retried
-            // POST could double-store / double-bill.
-            let retryable = status.as_u16() == 429
-                || (matches!(status.as_u16(), 502 | 503) && method.is_idempotent());
+            let retryable = status_is_retryable(status.as_u16(), method.is_idempotent());
             if retryable && attempt + 1 < attempts {
                 let ra = resp
                     .headers()
@@ -2462,9 +2582,8 @@ truncated answer, not the whole store."
             }
             // A drop WHILE READING the body is not a connect error — `send()` already
             // returned, so it surfaces here and nowhere else. Same rule as above: an
-            // idempotent read can be re-run safely, a write cannot (the server may have
-            // stored and billed it before the connection died). A timeout stays
-            // unretried either way.
+            // idempotent read can be re-run safely, a write cannot (it may already have
+            // landed before the connection died). A timeout stays unretried either way.
             let text = match read_capped(resp).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -2654,7 +2773,7 @@ mod tests {
     /// Serve `responses` one connection each (Connection: close), counting hits.
     /// `mock_server`, but it also hands back the raw requests it received — needed to
     /// assert on HEADERS (the idempotency key), which the hit counter can't show.
-    fn mock_server_recording(responses: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    pub(super) fn mock_server_recording(responses: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2713,7 +2832,7 @@ mod tests {
         (format!("http://{}", addr), hits)
     }
 
-    fn http(status: &str, headers: &str, body: &str) -> String {
+    pub(super) fn http(status: &str, headers: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
             body.len()
@@ -2768,7 +2887,8 @@ mod tests {
             ] {
                 match r {
                     Err(WosError::Api { status, message }) => {
-                        assert_eq!(status, 0, "a refusal is local, not from the service");
+                        // 400, not 0: a caller's own mistake.
+                        assert_eq!(status, 400, "a caller's mistake reads as a bad request");
                         assert!(message.contains("between 5 and 20"), "got {message}");
                     }
                     other => panic!("limit {bad} should be refused, got {other:?}"),
@@ -2829,10 +2949,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn image_calls_require_a_memory_id() {
-        // `get` and `delete` refused a blank id; the others sent it and let the server
-        // answer, which costs a round trip to learn the caller's own bug. `lineage` was
-        // given the trim without the check, so it posted memory_id:"" while Python and
-        // TypeScript raised locally — one surface answering the same call three ways.
+        // A blank id is refused locally, before any request.
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9");
         for r in [
             mem.get_image("alice", "").await.err(),
@@ -2910,9 +3027,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn get_is_retried_when_the_body_drops_mid_stream() {
-        // A read that survives a network blip in the TypeScript and Python clients must
-        // survive it here too. Without the retry the first attempt fails: the drop is not a
-        // connect error, and only connect errors were retried.
+        // A GET whose body drops mid-stream is retried, though the drop is not a
+        // connect error.
         let (base, hits) = dropping_server(1, http("200 OK", "", r#"{"collections":[],"count":0}"#));
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(2);
         let got = mem.list_stores().await;
@@ -2923,7 +3039,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_write_is_never_retried_when_the_body_drops_mid_stream() {
         // The other half, and the reason the rule is not simply "retry everything":
-        // headers came back, so the server may already have stored AND billed the write.
+        // headers came back, so the write may already have landed.
         let (base, hits) = dropping_server(1, http("200 OK", "", r#"{"id":"m1","status":"stored"}"#));
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(2);
         let got = mem.add("hello", "alice", serde_json::json!({})).await;
@@ -3095,10 +3211,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn bad_elements_are_skipped_not_fatal() {
-        // ONE malformed element must not fail the whole call
-        // ("invalid type: null, expected struct Memory"), so a single bad element
-        // destroyed every good memory in the batch — while Python/TypeScript
-        // returned the valid ones. Skip the bad elements, keep the good records.
+        // One malformed element must not fail the whole call: skip it and keep the
+        // good records.
         let (base, _) = mock_server(vec![
             http("200 OK", "", "{\"memories\":[null,1,\"x\",[],{\"id\":\"ok\",\"content\":\"c\"}]}"),
             http(
@@ -3295,9 +3409,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
-    // An empty body was treated differently by each SDK: the same `204 No Content`
-    // was a success (`{}`) in TypeScript and an "invalid JSON" error here. The three
-    // SDKs ship as one surface, so they now agree in both directions.
+    // A `204 No Content` is a success (`{}`), not a JSON parse error.
     #[tokio::test(flavor = "current_thread")]
     async fn no_content_is_a_success_not_a_parse_error() {
         let (base, _) = mock_server(vec![http("204 No Content", "", "")]);
@@ -3305,9 +3417,8 @@ mod tests {
         assert_eq!(mem.delete("alice", "m1").await.unwrap(), serde_json::json!({}));
     }
 
-    // The API has supported `Idempotency-Key` across the whole memory plane the entire
-    // time, but no SDK could send one — there was no header path at all (measured
-    // 2026-07-31). Pin that the header actually rides on the write.
+    // `Idempotency-Key` is accepted on the write routes. Pin that the header actually
+    // rides on the write rather than being dropped on the way out.
     #[tokio::test(flavor = "current_thread")]
     async fn idempotency_key_rides_on_the_write() {
         let (base, seen) = mock_server_recording(vec![
@@ -3397,9 +3508,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn search_opts_names_verify_and_max_images() {
-        // Of the three languages this is the only one that actually stops a typo.
-        //   Python's **opts and TypeScript's [key: string]: unknown let `verfy` through;
-        //   a struct cannot.
+        // A typed options struct cannot carry a typo: `verfy` is a compile error here,
+        // where an untyped bag has to be checked at runtime.
         let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{\"memories\":[]}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         mem.search_opts("q", "alice", 10, &SearchOpts { verify: Some(2), max_images: Some(5) })
@@ -3611,7 +3721,7 @@ mod tests {
         for bad in [0usize, 1, 4, 21, 500] {
             let opts = RecallOpts { limit: Some(bad), context_limit: None };
             match mem.recall_opts("q", "alice", &opts).await {
-                Err(WosError::Api { status: 0, message }) => {
+                Err(WosError::Api { status: 400, message }) => {
                     assert!(message.contains("between 5 and 20"), "got {message}")
                 }
                 other => panic!("expected a refusal for limit={bad}, got {other:?}"),
@@ -3787,5 +3897,213 @@ mod plain_http_host_tests {
         assert_eq!(host_of("http://127.0.0.1:8080/x"), "127.0.0.1");
         assert_eq!(host_of("http://localhost:3000"), "localhost");
         assert_eq!(host_of("http://[::1]:8080"), "::1");
+    }
+}
+
+#[cfg(test)]
+mod retry_status_tests {
+    use super::status_is_retryable;
+
+    #[test]
+    fn a_write_is_never_retried_on_an_ambiguous_status() {
+        // The whole reason the set is split: the error can arrive after the write
+        // already landed, so a retried POST would write twice.
+        for s in [408, 502, 503, 504] {
+            assert!(!status_is_retryable(s, false), "{s} retried a write");
+        }
+    }
+
+    #[test]
+    fn an_idempotent_read_retries_every_ambiguous_status() {
+        for s in [408, 502, 503, 504] {
+            assert!(status_is_retryable(s, true), "{s} was not retried on a read");
+        }
+    }
+
+    #[test]
+    fn rate_limiting_retries_whatever_the_method() {
+        assert!(status_is_retryable(429, false));
+        assert!(status_is_retryable(429, true));
+    }
+
+    #[test]
+    fn a_plain_failure_is_not_retried() {
+        for s in [400, 401, 403, 404, 409, 422, 500, 501] {
+            assert!(!status_is_retryable(s, true), "{s} should not retry");
+            assert!(!status_is_retryable(s, false), "{s} should not retry");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tolerance_tests {
+    //! One odd field must not delete the record.
+    use super::memories_from;
+
+    #[test]
+    fn a_wrong_typed_field_does_not_delete_the_memory() {
+        let v = serde_json::json!([
+            {"id": "m1", "content": "kept", "similarity": 0.9},
+            {"id": 123,   "content": 42,    "similarity": "high", "is_superseded": "yes"},
+            {"id": "m3",  "content": "also kept"}
+        ]);
+        let got = memories_from(Some(&v));
+        assert_eq!(got.len(), 3, "a record was dropped for one unreadable field");
+        assert_eq!(got[0].content, "kept");
+        assert_eq!(got[2].content, "also kept");
+        // The unreadable fields default; the record and its readable neighbours survive.
+        assert_eq!(got[1].content, "");
+        assert_eq!(got[1].id, None);
+        assert_eq!(got[1].similarity, 0.0);
+        assert!(!got[1].is_superseded);
+    }
+
+    #[test]
+    fn an_element_that_is_not_an_object_is_still_dropped() {
+        // Deliberate: an element that is not an object carries nothing to return.
+        let v = serde_json::json!([{"id": "m1", "content": "kept"}, "not an object", 7, null]);
+        assert_eq!(memories_from(Some(&v)).len(), 1);
+    }
+
+    #[test]
+    fn a_null_scalar_still_defaults() {
+        let v = serde_json::json!([{"id": "m1", "content": null, "similarity": null}]);
+        let got = memories_from(Some(&v));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "");
+        assert_eq!(got[0].similarity, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod add_bulk_tests {
+    //! These drive `add_bulk_with` itself and read what reached the socket, so the
+    //! reserved-field order is tested on the real method.
+    use super::tests::{http, mock_server_recording};
+    use super::Client;
+
+    fn sent(seen: &std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> serde_json::Value {
+        let raw = seen.lock().unwrap()[0].clone();
+        let body = raw.split("\r\n\r\n").nth(1).expect("request had no body");
+        serde_json::from_str(body).expect("body was not JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_category_is_sent_as_it_is() {
+        // An empty category is sent as it is.
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        mem.add_bulk("blob", "alice", "").await.unwrap();
+        assert_eq!(sent(&seen)["category"], "");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_timestamp_reaches_the_body() {
+        // Without it every backfilled memory carries the upload time, the store sorts
+        // wrong, and an event_from/event_to search misses it.
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        mem.add_bulk_with("blob", "alice", "notes", serde_json::json!({"timestamp": "2024-03-01T10:00:00Z"}))
+            .await
+            .unwrap();
+        let b = sent(&seen);
+        assert_eq!(b["timestamp"], "2024-03-01T10:00:00Z");
+        assert_eq!(b["category"], "notes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backfill_can_carry_a_date_and_a_key_at_once() {
+        // A dated backfill that is also safe to re-run.
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        mem.add_bulk_with_idempotent(
+            "blob", "alice", "notes",
+            serde_json::json!({"timestamp": "2024-03-01T10:00:00Z"}),
+            "import:run-7",
+        ).await.unwrap();
+        let raw = seen.lock().unwrap()[0].clone();
+        // hyper lowercases header names on the wire, so compare without case.
+        assert!(
+            raw.to_ascii_lowercase().contains("idempotency-key: import:run-7"),
+            "the key did not ride on the write: {raw}"
+        );
+        assert_eq!(sent(&seen)["timestamp"], "2024-03-01T10:00:00Z");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn extra_cannot_overwrite_the_reserved_fields() {
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        mem.add_bulk_with("real", "alice", "notes", serde_json::json!({
+            "user_id": "somebody_else", "content": "spoofed", "category": "hijacked"
+        }))
+        .await
+        .unwrap();
+        let b = sent(&seen);
+        assert_eq!(b["user_id"], "alice", "extra redirected the write to another store");
+        assert_eq!(b["content"], "real");
+        assert_eq!(b["category"], "notes");
+    }
+}
+
+#[cfg(test)]
+mod error_kind_tests {
+    //! A caller's own mistake and "nothing usable came back" must not look the same.
+    use super::{Client, ErrorKind, WosError};
+
+    fn kind_of(e: WosError) -> ErrorKind {
+        e.kind()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_argument_the_client_refuses_is_a_bad_request() {
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9");
+        for e in [
+            mem.search("q", "alice", 50).await.unwrap_err(),
+            mem.search("q", "alice", 1).await.unwrap_err(),
+            mem.usage(400).await.unwrap_err(),
+            mem.get("alice", "  ").await.unwrap_err(),
+        ] {
+            assert_eq!(kind_of(e), ErrorKind::BadRequest, "a caller mistake must read as one");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_exhausted_deadline_reads_like_a_connection_failure() {
+        // No answer arrived, so it reads as a connection failure.
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9")
+            .with_deadline(std::time::Duration::from_millis(1));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let e = mem.list_stores().await.unwrap_err();
+        assert_eq!(kind_of(e), ErrorKind::Connection);
+    }
+}
+
+#[cfg(test)]
+mod widening_tests {
+    //! A field the service adds must reach the caller.
+    use super::RecallResponse;
+
+    #[test]
+    fn a_field_this_struct_does_not_name_still_arrives() {
+        let v = serde_json::json!({
+            "short_term": {"turns": [], "count": 0},
+            "long_term": {"memories": [], "count": 0},
+            "context": {"around_top_memory": [], "count": 0},
+            "a_field_added_after_this_struct_was_written": {"n": 7},
+            "verify_used": 2
+        });
+        let got: RecallResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(got.extra["verify_used"], 2, "a named-later field was dropped");
+        assert_eq!(got.extra["a_field_added_after_this_struct_was_written"]["n"], 7);
+        // The three it does name still land where they did.
+        assert_eq!(got.short_term["count"], 0);
+    }
+
+    #[test]
+    fn a_reply_with_nothing_extra_leaves_it_empty() {
+        let v = serde_json::json!({"short_term": {}, "long_term": {}, "context": {}});
+        let got: RecallResponse = serde_json::from_value(v).unwrap();
+        assert!(got.extra.is_empty());
     }
 }
