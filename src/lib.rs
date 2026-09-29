@@ -73,18 +73,13 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// answer with a JSON object — see the empty-body check in `request`.
 const NO_BODY_STATUS: [u16; 3] = [204, 205, 304];
 
-/// The API normalizes a store id: lowercased, and every character outside
-/// `[a-z0-9_]` becomes `_`. So `Alice.Smith`, `alice-smith` and `alice_smith` are
-/// ALL the same store.
-///
-/// That is a data-exposure hazard for the most common way this SDK is used — one
-/// store per end user. Two accounts whose ids differ only by punctuation or case
-/// (`bob.lee@x.com` / `bob-lee@x.com`) silently share every memory, and nothing in
-/// the response says so: the note only appears when `create_store` creates one, and
-/// an app that reuses an existing store never sees it. Measured live 2026-08-05.
-///
-/// We cannot refuse the id — the API accepts it, and callers may have written it
-/// this way for a year. So we say it once, on stderr, at the moment it happens.
+/// A store id is 1-64 ASCII letters, digits, `.`, `_` and `-`, starting with a letter or
+/// digit. Creating any other id (an email address, a name in another script) is refused
+/// (400), so key stores on an id of your own. Store ids compare without regard to case:
+/// `Alice` and `alice` name one store. Ids that differ only in `.`, `_` or `-` cannot
+/// both exist: once `alice-smith` exists, creating `alice.smith` is refused (409) and
+/// using it answers 404. With one store per end user, derive the ids so two users never
+/// differ only in those three characters.
 fn normalize_store_id(id: &str) -> String {
     id.chars()
         .map(|c| {
@@ -100,12 +95,48 @@ const WARNED_STORE_IDS_MAX: usize = 1024;
 static WARNED_STORE_IDS: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
     std::sync::OnceLock::new();
 
+/// Refuse a metadata key that spells a store id or the idempotency key, compared in
+/// any case with spaces, `_`, `-` and `.` ignored. Those values have their own
+/// parameters.
+fn check_metadata_keys(metadata: &serde_json::Value) -> Result<(), WosError> {
+    if let Some(obj) = metadata.as_object() {
+        for k in obj.keys() {
+            let folded: String = k
+                .chars()
+                .filter(|c| !c.is_whitespace() && !matches!(c, '_' | '-' | '.'))
+                .flat_map(char::to_lowercase)
+                .collect();
+            if matches!(folded.as_str(), "userid" | "storeid" | "idempotencykey") {
+                return Err(WosError::Api {
+                    status: 400,
+                    message: format!(
+                        "{k:?} is not a metadata field: pass the store as user_id and an \
+                         idempotency key through the *_idempotent methods. Nothing was sent."
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The store ids the API accepts: 1-64 ASCII letters, digits, `.`, `_` and `-`,
+/// starting with a letter or digit.
+fn valid_store_id_format(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= 64
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
 fn warn_if_store_id_collapses(id: &str) {
     if id.is_empty() {
         return;
     }
+    let valid = valid_store_id_format(id);
     let normalized = normalize_store_id(id);
-    if normalized == id {
+    if valid && normalized == id {
         return;
     }
     let seen = WARNED_STORE_IDS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
@@ -115,13 +146,8 @@ fn warn_if_store_id_collapses(id: &str) {
             if g.iter().any(|s| s == id) {
                 false
             } else {
-                // This needs a ceiling. The shape the warning is aimed at is an email
-                // address, and the one-store-per-end-user pattern this SDK recommends
-                // accumulates **one entry per user**, never released for the life of the
-                // process. Fifty thousand users means fifty thousand entries (measured) —
-                // leaking in exactly the situation the warning exists to describe. Evict
-                // oldest-first, so a collision that first appears late still gets its
-                // warning.
+                // Bounded: one store per end user means one entry per user. Evict
+                // oldest-first, so an id that first appears late still gets its warning.
                 g.push_back(id.to_string());
                 while g.len() > WARNED_STORE_IDS_MAX {
                     g.pop_front();
@@ -131,12 +157,17 @@ fn warn_if_store_id_collapses(id: &str) {
         }
         Err(_) => true,
     };
-    if first {
+    if first && !valid {
         eprintln!(
-            "wontopos: store id {id:?} is stored as {normalized:?} (lowercased, and anything \
-             outside [a-z0-9_] becomes '_'). Ids that differ only by case or punctuation share \
-             ONE store and therefore one set of memories — if these ids come from your end \
-             users, normalize them yourself first so two people can never collide."
+            "wontopos: store id {id:?} is not a valid store id: use 1-64 ASCII letters, digits, \
+             '.', '_' and '-', starting with a letter or digit. Creating it is refused (400)."
+        );
+    } else if first {
+        eprintln!(
+            "wontopos: store id {id:?} normalizes to {normalized:?}. Ids that differ only by case \
+             name this same store; one that differs only by punctuation cannot be created beside \
+             it (409) and is not found when used (404). If these ids come from your end users, \
+             normalize them yourself first so two people never compete for one name."
         );
     }
 }
@@ -254,9 +285,10 @@ pub enum ErrorKind {
     PaymentRequired,
     /// 403 — not allowed.
     PermissionDenied,
-    /// 404 — store or resource not found.
+    /// 404 — the store or resource doesn't exist.
     NotFound,
-    /// 409 — concurrent write conflict.
+    /// 409 — another write to this store was in flight (nothing was stored; retry), or the
+    /// store id collides with an existing store's (permanent).
     Conflict,
     /// 429 — rate limited.
     RateLimited,
@@ -475,11 +507,8 @@ pub struct SelfSearch {
 
 /// Everything one search answered with, not just the merged memories.
 ///
-/// [`Client::search`] returns the memories and nothing else, which is the right answer
-/// for almost every call. Two options make it the wrong one: `max_images` asks for
-/// photos, which arrive in their own field, and `verify` is reported on by
-/// `verify_used`. Merging away both means paying for a search you shaped and never
-/// seeing what came of it.
+/// [`Client::search`] returns every memory as one `Vec`. This keeps the fields apart
+/// and adds `verify_used`, the report on the `verify` option.
 #[derive(Debug, Default)]
 pub struct SearchFull {
     /// What others said, and general memories.
@@ -487,7 +516,8 @@ pub struct SearchFull {
     /// The assistant's own words (speaker "me"); empty on a model that does not keep
     /// them apart.
     pub self_memories: Vec<Memory>,
-    /// Image memories, when `max_images` asked for any; empty otherwise.
+    /// Image memories the answer carried (one by default on an image-capable model, up
+    /// to `max_images`); empty when there were none.
     pub images: Vec<Memory>,
     /// Re-ask passes actually performed. `None` unless `verify` was sent; lower than
     /// requested means the store had nothing further to add.
@@ -866,29 +896,21 @@ pub struct Client {
 /// Back-compat alias.
 pub type WME = Client;
 
-/// Every memory a search returned, from both fields, as one `Vec`.
-///
-/// Some models answer with the assistant's own words in `self_memories`, not repeated
-/// in `memories`. `search` read only `memories`, so an assistant turn stored with
-/// `add_turn` was missing from its results on those models while the same query
-/// returned it on others — upgrading made search return LESS, and what went missing
-/// had already been retrieved and paid for.
-///
-/// Both fields, de-duplicated by id, each memory keeping its `speaker` so the caller
-/// can still tell who said what. Callers who want them kept apart use
-/// [`Client::search_self`], which exists for exactly that.
+/// Every memory a search returned — `memories`, then `self_memories`, then `images` —
+/// as one `Vec`, de-duplicated by id. Each keeps its `speaker`, and a photo carries
+/// `image_ref` in `extra`, so the caller can still tell them apart.
 fn merge_results(v: &serde_json::Value) -> Vec<Memory> {
     let mut out = memories_from(v.get("memories"));
-    let mine = memories_from(v.get("self_memories"));
-    if mine.is_empty() {
-        return out;
-    }
-    let seen: std::collections::HashSet<String> =
+    let mut seen: std::collections::HashSet<String> =
         out.iter().filter_map(|m| m.id.clone()).collect();
-    out.extend(mine.into_iter().filter(|m| match &m.id {
-        Some(id) => !seen.contains(id),
-        None => true,
-    }));
+    for m in memories_from(v.get("self_memories")).into_iter().chain(memories_from(v.get("images"))) {
+        if let Some(id) = &m.id {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+        }
+        out.push(m);
+    }
     out
 }
 
@@ -910,6 +932,18 @@ fn memories_from(v: Option<&serde_json::Value>) -> Vec<Memory> {
             .filter_map(|el| serde_json::from_value::<Memory>(el.clone()).ok())
             .collect(),
         None => Vec::new(),
+    }
+}
+
+/// `get` answers `{"memory": {...}}` on some models and the row itself on others.
+fn memory_from_get(v: serde_json::Value) -> serde_json::Value {
+    if let Some(m) = v.get("memory").filter(|m| m.is_object()) {
+        return m.clone();
+    }
+    if v.get("id").is_some_and(|id| id.is_string()) {
+        v
+    } else {
+        serde_json::json!({})
     }
 }
 
@@ -1140,6 +1174,7 @@ impl Client {
     /// `json!({"speaker": "me"})` for the assistant's own words, or a registered
     /// person's name (see [`Client::add_speaker`]).
     pub async fn add(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value) -> Result<serde_json::Value, WosError> {
+        check_metadata_keys(&metadata)?;
         let user_id = self.uid(user_id.into())?;
         self.post("/api/v1/memory/store", serde_json::json!({"user_id": user_id, "content": content, "metadata": metadata})).await
     }
@@ -1168,6 +1203,8 @@ impl Client {
     /// way through: a `data:...;base64,` prefix is dropped and all whitespace, including
     /// the newlines a wrapped base64 file carries, is removed. Nothing else is changed —
     /// URL-safe base64 is not converted, so send the standard alphabet.
+    ///
+    /// Both edges must be 700px or more; a smaller image is refused (400).
     ///
     /// What the service keeps is NOT your original. Over 1568px on the long edge the
     /// picture is downscaled to 1568 on the way in, and downscaling means re-encoding:
@@ -1204,6 +1241,7 @@ impl Client {
         extra: serde_json::Value,
         idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, WosError> {
+        check_metadata_keys(&metadata)?;
         let user_id = self.uid(user_id.into())?;
         let mut obj = serde_json::Map::new();
         if let Some(e) = extra.as_object() {
@@ -1363,12 +1401,11 @@ impl Client {
     /// count was sent on unchecked, and a 0 was rewritten to 10 here in the client —
     /// so a budget that computed zero was answered with ten memories, and billed.
     ///
-    /// `limit` bounds `memories`, not the returned `Vec`. On a model that keeps the
-    /// assistant's own words separate (Scroll 1.2+) those come back as well, so the
-    /// `Vec` can hold
-    /// more than `limit`. They were retrieved and billed either way; dropping them
-    /// would only hide what you already paid for. Size a prompt window on what you get
-    /// back, not on `limit`. [`Client::search_self`] hands the two back apart.
+    /// `limit` bounds `memories`, not the returned `Vec`. The assistant's own words
+    /// (Scroll 1.2+) and image memories (Tablet 2+, one unless `max_images` says
+    /// otherwise) come back in it as well, so it can hold more than `limit`. They are
+    /// billed either way. Size a prompt window on what you get back, not on `limit`.
+    /// [`Client::search_full`] hands the fields back apart.
     pub async fn search(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<Vec<Memory>, WosError> {
         let user_id = self.uid(user_id.into())?;
         // A zero used to be rewritten to ten here, and the caller who computed it —
@@ -1485,7 +1522,7 @@ impl Client {
     /// let mem = Client::new("wos-...");
     /// let r = mem.search_full("the day we moved", "alice", 10,
     ///                         &SearchOpts { max_images: Some(3), verify: Some(2) }).await?;
-    /// r.images.len();   // the photos, which `search` drops
+    /// r.images.len();   // the photos, apart from the text memories
     /// r.verify_used;    // re-ask passes that actually ran (billed per pass)
     /// # Ok(()) }
     /// ```
@@ -1524,11 +1561,8 @@ impl Client {
     /// Returns `{ memories, self_memories }` — `memories` is what others said and
     /// general memories, `self_memories` is the assistant's OWN words (stored with
     /// speaker "me"), kept apart so whoever reads them never confuses who said what.
-    /// On a model that does not keep them apart, `self_memories` is empty.
-    // This doc used to sit above `search_full` with nothing between them, so rustdoc
-    // put both blocks on that function and published this one with no documentation
-    // at all. `//`, not `///` — the note is for us, and a `///` line here would render
-    // it on docs.rs.
+    /// On a model that does not keep them apart, `self_memories` is empty. Image
+    /// memories are not included; [`Client::search`] and [`Client::search_full`] carry them.
     pub async fn search_self(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<SelfSearch, WosError> {
         let user_id = self.uid(user_id.into())?;
         check_search_limit(limit)?;
@@ -1700,7 +1734,7 @@ impl Client {
                 serde_json::json!({"user_id": user_id, "memory_id": memory_id.trim()}),
             )
             .await?;
-        Ok(v.get("memory").cloned().unwrap_or_else(|| serde_json::json!({})))
+        Ok(memory_from_get(v))
     }
 
     /// List a store's stored memories — the text you stored, plus its metadata.
@@ -2091,9 +2125,8 @@ truncated answer, not the whole store."
     /// `speaker` is the tag written at store time — `"me"` for the assistant's own words,
     /// otherwise a person's name. Same cursor paging as `list_images`.
     ///
-    /// `chunks` / `points_to_delete` report how many internal records a delete would
-    /// actually remove — usually more than `returned`, and worth showing to whoever is
-    /// about to confirm one.
+    /// `points_to_delete` is the count to show before anyone confirms a delete of this
+    /// speaker's memories.
     pub async fn by_speaker(
         &self,
         speaker: &str,
@@ -2198,13 +2231,16 @@ truncated answer, not the whole store."
     /// Create a store — the `user_id` you read and write under. Stores are
     /// explicit: a store must exist before you `add` to or `search` it, otherwise
     /// those calls return 404. Idempotent. Every account starts with a `default`
-    /// store. Returns `{ "user_id", "status" }` (`status` is `"created"`/`"exists"`).
+    /// store. Returns `{ "user_id", "status" }` (`status` is `"created"`/`"exists"`), plus
+    /// `canonical_id` and `note` when the id is filed under a normalized form.
     pub async fn create_store(&self, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         self.post("/api/v1/memory/collection", serde_json::json!({ "user_id": user_id })).await
     }
 
-    /// List your stores: `[{ "user_id", "created_at" }, ...]` (`default` first).
+    /// List your stores: `[{ "user_id", "created_at", "canonical_id"? }, ...]`
+    /// (`default` first). Each `user_id` is the id the store was created with;
+    /// `canonical_id` appears when the normalized form differs.
     pub async fn list_stores(&self) -> Result<Vec<serde_json::Value>, WosError> {
         let v = self.request(reqwest::Method::GET, "/api/v1/memory/collections", None, None).await?;
         Ok(v.get("collections").and_then(|c| c.as_array()).cloned().unwrap_or_default())
@@ -3362,6 +3398,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn get_takes_a_flat_row() {
+        let (base, _) = mock_server(vec![
+            http("200 OK", "", "{\"id\":\"9b2d\",\"content\":\"tea\"}"),
+            http("200 OK", "", "{\"user_id\":\"u\",\"memory\":null}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let m = mem.get("u", "9b2d").await.unwrap();
+        assert_eq!(m["content"], "tea");
+        assert_eq!(mem.get("u", "9b2d").await.unwrap(), serde_json::json!({}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn search_returns_image_rows_after_the_text_each_id_once() {
+        let payload = "{\"memories\":[{\"id\":\"m1\"},{\"id\":\"dup\"}],\"self_memories\":[{\"id\":\"s1\"}],\
+                       \"images\":[{\"id\":\"dup\"},{\"id\":\"i1\",\"content\":\"\"}]}";
+        let (base, _) = mock_server(vec![http("200 OK", "", payload), http("200 OK", "", payload)]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let ids: Vec<_> = mem.search("q", "alice", 10).await.unwrap().into_iter().filter_map(|m| m.id).collect();
+        assert_eq!(ids, ["m1", "dup", "s1", "i1"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn list_all_memories_stops_on_repeated_cursor() {
         // A server that repeats a cursor must not loop forever (only 2 requests).
         let (base, hits) = mock_server(vec![
@@ -3779,17 +3837,45 @@ mod tests {
     }
     // ── 2.2.25 ─────────────────────────────────────────────────────────────
 
-    // The API lowercases a store id and rewrites anything outside [a-z0-9_] to '_', so
-    // Alice.Smith · alice-smith · alice_smith are one store (measured against production
-    // 2026-08-05). In an app with one store per end user, two people get merged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_refuses_a_store_name_as_metadata_before_the_network() {
+        let off = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9");
+        for md in [
+            serde_json::json!({"userId": "bob"}),
+            serde_json::json!({"store_id": "t"}),
+            serde_json::json!({"Idempotency-Key": "k"}),
+        ] {
+            match off.add("x", "alice", md.clone()).await {
+                Err(WosError::Api { status: 400, message }) => assert!(message.contains("not a metadata field")),
+                other => panic!("{md}: expected a refusal, got {other:?}"),
+            }
+            match off.add_with("x", "alice", md, serde_json::json!({})).await {
+                Err(WosError::Api { status: 400, .. }) => {}
+                other => panic!("add_with: expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(check_metadata_keys(&serde_json::json!({"store": "Costco", "user_id_2": "b", "model": "m"})).is_ok());
+    }
+
+    #[test]
+    fn the_accepted_store_id_format() {
+        for ok in ["a", "Alice.Smith", "team-a_1", &"x".repeat(64)] {
+            assert!(valid_store_id_format(ok), "{ok:?}");
+        }
+        for bad in ["", "-a", ".a", "bob.lee@example.com", "na\u{ef}ve", "a b", &"x".repeat(65)] {
+            assert!(!valid_store_id_format(bad), "{bad:?}");
+        }
+    }
+
+    // The normalized form the API derives: lowercased, anything outside [a-z0-9_] as '_'.
     #[test]
     fn store_id_normalization_is_what_the_api_does() {
         assert_eq!(normalize_store_id("Alice.Smith"), "alice_smith");
         assert_eq!(normalize_store_id("alice-smith"), "alice_smith");
-        assert_eq!(normalize_store_id("bob.lee@x.com"), "bob_lee_x_com");
-        assert_eq!(normalize_store_id("bob-lee@x.com"), "bob_lee_x_com"); // ← collision
-        assert_eq!(normalize_store_id("alice_smith"), "alice_smith"); // already normal form
-        assert_eq!(normalize_store_id("na\u{ef}ve"), "na_ve"); // non-ASCII folds too
+        assert_eq!(normalize_store_id("bob.lee.x"), "bob_lee_x");
+        assert_eq!(normalize_store_id("bob-lee-x"), "bob_lee_x");
+        assert_eq!(normalize_store_id("alice_smith"), "alice_smith");
+        assert_eq!(normalize_store_id("na\u{ef}ve"), "na_ve");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3823,9 +3909,9 @@ mod store_id_warning_bound_tests {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// This warning fires on email-shaped ids, and the pattern this SDK recommends
-    /// (one store per end user) feeds it one per user. Unbounded, it grows for the
-    /// life of the process.
+    /// This warning fires on ids whose normalized form differs or that the API refuses,
+    /// and with one store per end user it sees one id per user. Unbounded, it grows for
+    /// the life of the process.
     #[test]
     fn warned_ids_stay_bounded() {
         let _g = serial();
@@ -3855,16 +3941,32 @@ mod store_id_warning_bound_tests {
         assert!(g.len() <= WARNED_STORE_IDS_MAX);
     }
 
+    #[test]
+    fn an_invalid_id_in_normal_form_is_still_warned_about() {
+        let _g = serial();
+        let ids = ["_invalid_probe_a".to_string(), "y".repeat(65)];
+        for id in &ids {
+            warn_if_store_id_collapses(id);
+        }
+        let g = WARNED_STORE_IDS.get().unwrap().lock().unwrap();
+        assert!(ids.iter().all(|id| g.iter().any(|s| s == id)));
+    }
+
     /// An id that does not fold is never recorded, so it cannot waste the cap.
     #[test]
     fn clean_ids_are_not_recorded() {
         let _g = serial();
-        _reset_warning_state();
-        for i in 0..100 {
-            warn_if_store_id_collapses(&format!("user_{i}"));
+        let ids: Vec<String> = (0..100).map(|i| format!("clean_id_probe_{i}")).collect();
+        for id in &ids {
+            warn_if_store_id_collapses(id);
         }
-        let n = WARNED_STORE_IDS.get().map(|m| m.lock().unwrap().len()).unwrap_or(0);
-        assert_eq!(n, 0, "an already-canonical id has no reason to be recorded");
+        if let Some(m) = WARNED_STORE_IDS.get() {
+            let g = m.lock().unwrap();
+            assert!(
+                !g.iter().any(|s| ids.contains(s)),
+                "an already-canonical id has no reason to be recorded"
+            );
+        }
     }
 }
 

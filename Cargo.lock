@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "wontopos"
-version = "2.2.39"
+version = "2.2.40"
 dependencies = [
  "futures-util",
  "httpdate",
