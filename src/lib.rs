@@ -20,12 +20,17 @@
 //! and searching call no LLM.
 //!
 //! Reliability: every call retries transient failures with exponential backoff
-//! and jitter, honoring `Retry-After` — 429 always; 408/502/503/504 and network errors
-//! only when a retry can never double-process a write (idempotent calls, or a
-//! failure at connect time). Timeouts are never retried: the write may have
-//! landed, and re-sending would bill it twice.
+//! and jitter, honoring `Retry-After` up to 30s. 429, and a 409 saying another write
+//! to the store was in flight, are retried on every call; 408/502/503/504 and network
+//! errors only when a retry cannot apply a write twice (idempotent calls, or a failure
+//! at connect time). Timeouts are never retried: the write may already have been
+//! applied. A `Retry-After` above 30s, or a wait that does not fit in the
+//! [`Client::with_deadline`] budget, returns that response's error at once.
 //! Requests time out after 30s (connect 10s). Tune with
 //! [`Client::with_retries`] (0 disables) and [`Client::with_timeout`].
+//!
+//! Runtime: every call is async and needs a Tokio 1.x runtime with IO and time
+//! enabled (`#[tokio::main]` enables both). There is no blocking client.
 //!
 //! Debugging: set `WONTOPOS_LOG=debug` to log method/path/status/timing/retries
 //! to stderr — never memory content, request bodies, or the API key.
@@ -184,38 +189,52 @@ const KNOWN_FILTER_KEYS: [&str; 6] = [
     "min_importance",
 ];
 
-/// Same cap, same reason, as the store-id warn set.
-const WARNED_FILTER_KEYS_MAX: usize = 1024;
-static WARNED_FILTER_KEYS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+/// The metadata keys the service keeps. It drops every other key on the way in, so a
+/// misspelled `speaker` stores an untagged memory.
+const KNOWN_METADATA_KEYS: [&str; 4] = ["speaker", "event_date", "category", "conversation_id"];
+
+/// Same cap, same reason, as the store-id warn set: an app forwarding user-supplied
+/// keys would otherwise grow these sets forever. Losing an entry costs a repeated
+/// warning, never correctness.
+const WARNED_KEYS_MAX: usize = 1024;
+type WarnSet = std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>;
+static WARNED_FILTER_KEYS: WarnSet = std::sync::OnceLock::new();
+static WARNED_METADATA_KEYS: WarnSet = std::sync::OnceLock::new();
+
+/// Record `key` in a bounded warn-once set. True the first time it is seen.
+fn first_sighting(set: &WarnSet, key: &str) -> bool {
+    let seen = set.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    // Losing the warning because the lock is poisoned is worse than repeating it.
+    let Ok(mut g) = seen.lock() else { return true };
+    let inserted = g.insert(key.to_string());
+    while g.len() > WARNED_KEYS_MAX {
+        let Some(victim) = g.iter().next().cloned() else { break };
+        g.remove(&victim);
+    }
+    inserted
+}
 
 fn warn_on_unknown_filters(body: &serde_json::Value) {
     let Some(filters) = body.get("filters").and_then(|f| f.as_object()) else { return };
-    let seen = WARNED_FILTER_KEYS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     for k in filters.keys() {
-        if KNOWN_FILTER_KEYS.contains(&k.as_str()) {
-            continue;
-        }
-        let first = match seen.lock() {
-            Ok(mut g) => {
-                let inserted = g.insert(k.clone());
-                // 2.2.27 capped the store-id warn set and left this sibling unbounded.
-                // An app forwarding user-supplied filter keys grows it forever, one
-                // entry per distinct typo. Losing an entry costs a repeated warning,
-                // never correctness.
-                while g.len() > WARNED_FILTER_KEYS_MAX {
-                    let Some(victim) = g.iter().next().cloned() else { break };
-                    g.remove(&victim);
-                }
-                inserted
-            }
-            Err(_) => true,
-        };
-        if first {
+        if !KNOWN_FILTER_KEYS.contains(&k.as_str()) && first_sighting(&WARNED_FILTER_KEYS, k) {
             eprintln!(
                 "wontopos: unknown search filter {k:?} — the API drops keys it does not know, so \
                  this filter has NO effect and the search is wider than you think. Known keys: {}",
                 KNOWN_FILTER_KEYS.join(", ")
+            );
+        }
+    }
+}
+
+fn warn_on_unknown_metadata(metadata: &serde_json::Value) {
+    let Some(md) = metadata.as_object() else { return };
+    for k in md.keys() {
+        if !KNOWN_METADATA_KEYS.contains(&k.as_str()) && first_sighting(&WARNED_METADATA_KEYS, k) {
+            eprintln!(
+                "wontopos: unknown metadata key {k:?}: the service keeps only {} and drops every \
+                 other key, so this value is not stored.",
+                KNOWN_METADATA_KEYS.join(", ")
             );
         }
     }
@@ -227,8 +246,10 @@ pub fn _reset_warning_state() {
     if let Some(m) = WARNED_STORE_IDS.get() {
         if let Ok(mut g) = m.lock() { g.clear(); }
     }
-    if let Some(m) = WARNED_FILTER_KEYS.get() {
-        if let Ok(mut g) = m.lock() { g.clear(); }
+    for set in [&WARNED_FILTER_KEYS, &WARNED_METADATA_KEYS] {
+        if let Some(m) = set.get() {
+            if let Ok(mut g) = m.lock() { g.clear(); }
+        }
     }
 }
 
@@ -255,21 +276,100 @@ pub enum WosError {
 impl std::fmt::Display for WosError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WosError::Network(e) => write!(f, "network error: {e}"),
+            WosError::Network(e) => {
+                // Never the URL: its query carries store ids.
+                let text = e.to_string();
+                let text = text.split(" for url (").next().unwrap_or("");
+                match network_cause(e) {
+                    Some(cause) => write!(f, "network error: {text} ({cause})"),
+                    None => write!(f, "network error: {text}"),
+                }
+            }
             WosError::Api { status, message } => write!(f, "[{status}] {message}"),
         }
     }
 }
-impl std::error::Error for WosError {}
+impl std::error::Error for WosError {
+    /// The transport error behind a [`WosError::Network`].
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WosError::Network(e) => Some(e),
+            WosError::Api { .. } => None,
+        }
+    }
+}
 impl From<reqwest::Error> for WosError {
     fn from(e: reqwest::Error) -> Self {
         // An `error_for_status()` failure carries the HTTP status — surface it
         // as Api (kind() = Auth/NotFound/...), not as a bogus Connection error.
         match e.status() {
-            Some(s) => WosError::Api { status: s.as_u16(), message: e.to_string() },
-            None => WosError::Network(e),
+            Some(s) => WosError::Api { status: s.as_u16(), message: e.without_url().to_string() },
+            None => network_error(e),
         }
     }
+}
+
+/// A transport failure as this crate reports it: without the request URL, whose
+/// query can carry store ids.
+fn network_error(e: reqwest::Error) -> WosError {
+    WosError::Network(e.without_url())
+}
+
+/// A request that could not be built never left this process and never will on a
+/// retry. Every header is checked before this point, so what is left is the URL.
+fn builder_error(e: reqwest::Error) -> WosError {
+    let why = std::error::Error::source(&e)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "not a usable URL".into());
+    invalid_base_url(&why)
+}
+
+fn invalid_base_url(why: &str) -> WosError {
+    WosError::Api {
+        status: 400,
+        message: format!("invalid base_url ({why}). Pass the service root, e.g. {DEFAULT_BASE_URL}"),
+    }
+}
+
+/// A short name for why a transport call failed, read from the error chain.
+fn network_cause(e: &reqwest::Error) -> Option<&'static str> {
+    if e.is_timeout() {
+        return Some("timed out");
+    }
+    let mut next: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    let mut tcp_stage = false;
+    while let Some(s) = next {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => return Some("connection refused"),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                    return Some("connection reset")
+                }
+                std::io::ErrorKind::TimedOut => return Some("timed out"),
+                _ => {}
+            }
+        }
+        let text = s.to_string().to_ascii_lowercase();
+        if text.contains("dns error") || text.contains("failed to lookup address") {
+            return Some("dns");
+        }
+        if text.contains("certificate") || text.contains("tls") || text.contains("ssl") || text.contains("handshake") {
+            return Some("tls");
+        }
+        if text.contains("connection closed") || text.contains("end of file") {
+            return Some("connection closed");
+        }
+        tcp_stage |= text.starts_with("tcp ");
+        next = s.source();
+    }
+    if e.is_connect() {
+        // A connect failure outside the TCP and DNS steps is the TLS handshake.
+        return Some(if tcp_stage { "connect failed" } else { "tls" });
+    }
+    if e.is_body() || e.is_decode() {
+        return Some("response body interrupted");
+    }
+    None
 }
 
 /// Coarse classification of a failure — match on this instead of raw status codes.
@@ -277,7 +377,8 @@ impl From<reqwest::Error> for WosError {
 pub enum ErrorKind {
     /// No response reached us (DNS/TLS/timeout/connection).
     Connection,
-    /// 400 — malformed request.
+    /// 400, 413 or 422: the request was refused as sent (malformed, too large, or an
+    /// idempotency key reused with a different body).
     BadRequest,
     /// 401 — missing or invalid API key.
     Auth,
@@ -287,17 +388,17 @@ pub enum ErrorKind {
     PermissionDenied,
     /// 404 — the store or resource doesn't exist.
     NotFound,
-    /// 409 — another write to this store was in flight (nothing was stored; retry), or the
-    /// store id collides with an existing store's (permanent).
+    /// 409: another write to this store was in flight (retried automatically; nothing
+    /// was stored), or the store id collides with an existing one (not retried).
     Conflict,
     /// 429 — rate limited.
     RateLimited,
     /// 5xx — server failure.
     ///
     /// `502` / `503` / `504` are transient: this client already retries them where a
-    /// retry cannot double-process a write. `501` is NOT — it means the engine behind the
-    /// selected model does not implement that endpoint at all, so retrying can never
-    /// succeed. Pick a model that supports it ([`Client::list_models`]) instead.
+    /// retry cannot apply a write twice. `501` is NOT: the selected model does not
+    /// implement that endpoint, so retrying can never succeed. Pick a model that
+    /// supports it ([`Client::list_models`]) instead.
     Server,
     /// Any other status.
     Other,
@@ -320,7 +421,7 @@ impl WosError {
                 // cap carries the response's own status and the page-walk ceiling
                 // carries 200, so neither lands here. Every caller mistake is 400.
                 0 => ErrorKind::Connection,
-                400 => ErrorKind::BadRequest,
+                400 | 413 | 422 => ErrorKind::BadRequest,
                 401 => ErrorKind::Auth,
                 402 => ErrorKind::PaymentRequired,
                 403 => ErrorKind::PermissionDenied,
@@ -417,15 +518,12 @@ pub struct Memory {
     #[serde(default, deserialize_with = "null_to_default")]
     pub event_date: Option<String>,
     /// WHO said it: `"me"` for the agent's own words, or a registered person's name.
-    /// `None` when the memory carries no speaker tag. Every search result carries this
-    /// (the docs say so), so it is a named field rather than something to dig for
-    /// under `extra`.
+    /// `None` when the memory carries no speaker tag.
     #[serde(default, deserialize_with = "null_to_default")]
     pub speaker: Option<String>,
     /// The memory's time written in the requested delivery form — `"a couple weeks
     /// ago"` (memoir) or `"2 weeks ago (Jun 09)"` (archive). Present only when the
-    /// call asked for a form on a form-capable model. Same story as `speaker`: it
-    /// arrived, but only in `extra`.
+    /// call asked for a form on a model whose `capabilities` include `forms`.
     #[serde(default, deserialize_with = "null_to_default")]
     pub time: Option<String>,
     #[serde(flatten)]
@@ -461,21 +559,19 @@ pub struct SearchOpts {
     /// LLM runs at any value. It stops early when a pass finds nothing new; the
     /// response's `verify_used` says how many actually ran.
     ///
-    /// Each pass is another engine call that can add up to `limit` more memories, so it
-    /// costs more — you are billed for what is delivered. Helps most on questions needing
-    /// several distinct memories from far apart in the history; does little on a
-    /// single-fact lookup.
+    /// Each pass can add up to `limit` more memories, and delivered memories are
+    /// billed, so it costs more. Helps most on questions needing several distinct
+    /// memories from far apart in the history; does little on a single-fact lookup.
     ///
-    /// Needs a re-ask-capable model. An older one REFUSES the call (403) rather than
-    /// charging for passes that never happened.
+    /// Needs a model whose [`Client::list_models`] `capabilities` include `re_ask`.
+    /// Any other refuses the call (403).
     pub verify: Option<u8>,
     /// How many image memories the answer may carry, 0–5. `None` lets the service use
-    /// 1; the MCP server defaults its own tool to 0 instead. `Some(0)` asks for
-    /// none. Out of range is refused, not clamped — quietly cutting 5 to 1 would leave
-    /// you believing you got five.
+    /// one; `Some(0)` asks for none. Out of range is refused before sending, not
+    /// clamped: quietly cutting 6 to 5 would leave you believing you got six.
     ///
-    /// Needs an image-capable model, and is refused (403) on one without it rather than
-    /// answering with no images.
+    /// Needs a model whose [`Client::list_models`] `capabilities` include `images`.
+    /// Any other refuses the call (403) rather than answering with no images.
     pub max_images: Option<usize>,
 }
 
@@ -488,11 +584,11 @@ pub struct RecallOpts {
     /// Long-term memories to recall, 5–20 (default 10). Out of range is refused, not
     /// clamped — asking for 20 and silently getting 10 reads as "that is all there is".
     ///
-    /// Needs a limit-aware model. An older one recalls a fixed ten whatever you send, so
-    /// the API refuses the call (403) rather than answering with a number you did not ask for.
+    /// A model that recalls a fixed ten refuses the call (403) rather than answering
+    /// with a number you did not ask for.
     pub limit: Option<usize>,
     /// How much surrounding context is attached around the best match, 0–20 (default 10).
-    /// `Some(0)` attaches none. Same model floor as `limit`.
+    /// `Some(0)` attaches none. Same model rule as `limit`.
     pub context_limit: Option<usize>,
 }
 
@@ -501,7 +597,8 @@ pub struct RecallOpts {
 pub struct SelfSearch {
     /// What others said, and general memories.
     pub memories: Vec<Memory>,
-    /// The assistant's own words (stored with speaker "me"); empty on non-self models.
+    /// The assistant's own words (stored with speaker "me"); empty on a model whose
+    /// [`Client::list_models`] `capabilities` do not include `self_memories`.
     pub self_memories: Vec<Memory>,
 }
 
@@ -509,15 +606,17 @@ pub struct SelfSearch {
 ///
 /// [`Client::search`] returns every memory as one `Vec`. This keeps the fields apart
 /// and adds `verify_used`, the report on the `verify` option.
+///
+/// Search `filters` apply to `memories`; `self_memories` are not filtered.
 #[derive(Debug, Default)]
 pub struct SearchFull {
     /// What others said, and general memories.
     pub memories: Vec<Memory>,
-    /// The assistant's own words (speaker "me"); empty on a model that does not keep
-    /// them apart.
+    /// The assistant's own words (speaker "me"); empty on a model whose
+    /// `capabilities` do not include `self_memories`. Not narrowed by `filters`.
     pub self_memories: Vec<Memory>,
-    /// Image memories the answer carried (one by default on an image-capable model, up
-    /// to `max_images`); empty when there were none.
+    /// Image memories the answer carried (one by default on a model whose
+    /// `capabilities` include `images`, up to `max_images`); empty when there were none.
     pub images: Vec<Memory>,
     /// Re-ask passes actually performed. `None` unless `verify` was sent; lower than
     /// requested means the store had nothing further to add.
@@ -526,27 +625,18 @@ pub struct SearchFull {
     pub raw: serde_json::Value,
 }
 
-/// The engine every call uses unless the caller names another.
+/// The model every call uses unless the caller names another; pin another with
+/// `Client::new(key).with_model("tablet-1")`. What each model can do is listed in
+/// [`Client::list_models`] `capabilities`.
 ///
-/// Tablet 2 costs the same per token as Tablet 1 and is the one that serves images,
-/// re-ask passes (`verify`), and `self_memories`, so a caller who names nothing gets
-/// the engine that can answer the most. All models read the same memory, so switching
-/// is a header, not a migration. Pin an older one explicitly with
-/// `Client::new(key).with_model("tablet-1")`.
-///
-/// This paragraph used to sit above `SearchFull` with nothing between them, so rustdoc
-/// read it as that struct's documentation and docs.rs published `SearchFull` under the
-/// summary line "The engine every call uses…" — while the constant it describes had no
-/// documentation at all.
+/// Every model on the shared pool lists, fetches and deletes the same memories, but a
+/// search may not find memories stored through a different model. Store and search
+/// with the same one.
 const DEFAULT_MODEL: &str = "tablet-2";
 
-/// A page walk has to stop somewhere, and 1,000,000 pages was not a stop: at 100 per
-/// page that is 100 million memories, so a server minting a fresh cursor every time
-/// would spend hours and a million billed requests before it fired. 20,000 pages is
-/// two million memories — past any real store, reached in minutes.
-///
-/// Falling out of the loop returned a truncated Vec that looks exactly like a complete
-/// one, so hitting this is an error rather than a quiet end.
+/// A page walk stops after this many pages: at 100 per page that is two million
+/// memories, past any real store. Reaching it is an error, never a quiet end, because a
+/// truncated `Vec` looks exactly like a complete one.
 const MAX_PAGES: u32 = 20_000;
 
 /// The count shared by `search` and `recall`. 5 to 20 inclusive.
@@ -558,49 +648,36 @@ pub const CONTEXT_LIMIT_MIN: usize = 0;
 /// `recall`'s surrounding-context count. 0 to 20 inclusive; 0 attaches none.
 pub const CONTEXT_LIMIT_MAX: usize = 20;
 
-/// Refuse a count outside the range rather than quietly adjusting it. `search` and
-/// `recall` share it.
-///
-/// The service has refused anything else from the start, because asking for 20 and
-/// silently getting 10 reads as "that is all there is". Search had no contract at
-/// all: the three clients sent
-/// whatever they were given, the MCP server allowed 1 to 60, and the service quietly
-/// capped at 50 with no floor. Four surfaces, four answers, and the caller could not
-/// tell which one they got.
-///
-/// Refusing rather than clamping is the same decision as 2.2.35's, where a `limit`
-/// of 0 here had been rewritten to 10 and the caller was handed ten memories they
-/// had not asked for, and the bill for them. A zero is still not silently changed —
-/// it is now refused, which is the part that was missing.
-/// `recall`'s `context_limit`, 0 to 20. Same reason as the count: [`RecallOpts`]
-/// promises out-of-range is refused, and a promise the client does not keep is worse
-/// than no promise — the caller reads the doc, sends 50, and the failure arrives from
-/// the service with no hint the SDK knew all along.
-///
-/// `Some(0)` is a real answer ("attach none"), not a missing value, so it passes.
-/// A backoff that never sleeps past the budget — sleeping through the deadline
-/// spends the caller's whole allowance on waiting.
-///
-/// Errors when the wait does not fit. Clamping it to what is left and retrying anyway
-/// is the same answer as having no deadline: the call still spends the whole
-/// allowance, and the attempt it buys has nothing left to finish in. `attempt_budget`
-/// refuses that attempt one line later, so all the clamped sleep bought was the delay
-/// before saying so.
-fn sleep_within(
-    delay: std::time::Duration,
-    deadline_at: Option<std::time::Instant>,
-    deadline: Option<std::time::Duration>,
-) -> Result<std::time::Duration, WosError> {
-    let Some(at) = deadline_at else { return Ok(delay) };
-    if delay > at.saturating_duration_since(std::time::Instant::now()) {
-        return Err(WosError::Api {
-            status: 0,
-            message: format!("deadline of {:?} exhausted", deadline.unwrap_or_default()),
-        });
+/// One page of images, a speaker's words, or revisions: 5 to 20 inclusive.
+const PAGE_LIMIT_MIN: usize = 5;
+const PAGE_LIMIT_MAX: usize = 20;
+/// One page of `list_memories`: 1 to 500 inclusive. The service reads anything
+/// above 500 as 500, so it is refused here instead.
+const LIST_LIMIT_MIN: usize = 1;
+const LIST_LIMIT_MAX: usize = 500;
+/// Image memories one search may carry: 0 to 5 inclusive.
+const MAX_IMAGES_MAX: usize = 5;
+
+/// The longest wait this client sleeps before a retry. A service asking for more gets
+/// its answer handed back at once instead of a sleep the caller did not plan for.
+const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether sleeping `delay` still leaves time for another attempt inside the budget.
+fn fits_in(delay: std::time::Duration, deadline_at: Option<std::time::Instant>) -> bool {
+    match deadline_at {
+        Some(at) => delay < at.saturating_duration_since(std::time::Instant::now()),
+        None => true,
     }
-    Ok(delay)
 }
 
+/// Whether a transport failure is the attempt's own timeout firing at a budget that
+/// was cut to what was left of the deadline: the deadline ran out mid-attempt.
+fn ran_out_of_budget(e: &reqwest::Error, budget: std::time::Duration, per_attempt: std::time::Duration) -> bool {
+    budget < per_attempt && e.is_timeout() && !e.is_connect()
+}
+
+/// `recall`'s `context_limit`, 0 to 20, refused rather than adjusted. `Some(0)` is a
+/// real answer ("attach none"), not a missing value, so it passes.
 fn check_context_limit(n: usize) -> Result<(), WosError> {
     // A range, not two comparisons: `n < CONTEXT_LIMIT_MIN` can never be true for a
     // usize, and a guard half of which is dead is a guard nobody can read.
@@ -627,6 +704,42 @@ fn check_search_limit(limit: usize) -> Result<(), WosError> {
         });
     }
     Ok(())
+}
+
+/// A page size for images, a speaker's words or revisions: 5 to 20, refused rather
+/// than adjusted.
+fn check_page_limit(name: &str, n: usize) -> Result<(), WosError> {
+    if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&n) {
+        return Err(WosError::Api {
+            status: 400,
+            message: format!("{name} must be between {PAGE_LIMIT_MIN} and {PAGE_LIMIT_MAX}, got {n}."),
+        });
+    }
+    Ok(())
+}
+
+fn check_list_limit(n: usize) -> Result<(), WosError> {
+    if !(LIST_LIMIT_MIN..=LIST_LIMIT_MAX).contains(&n) {
+        return Err(WosError::Api {
+            status: 400,
+            message: format!("limit must be between {LIST_LIMIT_MIN} and {LIST_LIMIT_MAX}, got {n}."),
+        });
+    }
+    Ok(())
+}
+
+/// `max_images` in a search body: a whole number from 0 to 5. JSON `true`, `2.5` or
+/// `"3"` is refused here rather than read by the service as something else. `null`
+/// reads as absent (the default of one).
+fn check_max_images(body: &serde_json::Value) -> Result<(), WosError> {
+    let Some(v) = body.get("max_images").filter(|v| !v.is_null()) else { return Ok(()) };
+    match v.as_u64() {
+        Some(n) if n <= MAX_IMAGES_MAX as u64 => Ok(()),
+        _ => Err(WosError::Api {
+            status: 400,
+            message: format!("max_images must be a whole number between 0 and {MAX_IMAGES_MAX}, got {v}."),
+        }),
+    }
 }
 const DEFAULT_USER: &str = "default";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -676,12 +789,8 @@ async fn read_capped(resp: reqwest::Response) -> Result<String, WosError> {
     Ok(String::from_utf8_lossy(&read_capped_bytes(resp).await?).into_owned())
 }
 
-/// The same ceiling, for a body that is not text.
-///
-/// `get_image` called `resp.bytes()`, which buffers whatever arrives. The cap exists for
-/// a hostile or broken `base_url`, and an image endpoint is exactly where that shows up —
-/// the JSON paths were guarded while the one path that returns megabytes was not. One
-/// implementation, two callers, so the two cannot drift apart.
+/// The same ceiling, for a body that is not text. One implementation for the JSON and
+/// the image paths, so the two cannot drift apart.
 async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>, WosError> {
     // The response's own status, not 0: a body did arrive. 0 means nothing came back
     // and reads as `ErrorKind::Connection`, which callers retry.
@@ -698,7 +807,7 @@ async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>, WosError>
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(WosError::Network)?;
+        let chunk = chunk.map_err(network_error)?;
         if buf.len() + chunk.len() > MAX_RESPONSE_BYTES {
             return Err(WosError::Api {
                 status: http,
@@ -714,23 +823,42 @@ async fn read_capped_bytes(resp: reqwest::Response) -> Result<Vec<u8>, WosError>
 /// fine (local dev, or a proxy on the same box); anything else gets a warning,
 /// not an error, so private-network gateways keep working.
 fn warn_if_plain_http(base_url: &str) {
-    // Scheme compare is case-insensitive: `HTTP://` connects in plaintext too.
-    let lower = base_url.to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("http://") else { return };
-    let authority = rest.split('/').next().unwrap_or("");
-    // Strip userinfo FIRST. `http://127.0.0.1:9@evil.example` has authority
-    // "127.0.0.1:9@evil.example"; splitting on ':' first yields "127.0.0.1", so this
-    // check called it loopback and said nothing while the key travelled in cleartext to
-    // evil.example. The host is what follows the LAST '@'.
-    let hostport = authority.rsplit('@').next().unwrap_or("");
-    let host = if let Some(v6) = hostport.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
-    } else {
-        hostport.split(':').next().unwrap_or("")
-    };
-    if !matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") {
+    if plain_http_to_remote(base_url) {
         eprintln!("wontopos: base_url uses plain HTTP on a non-local host, so the API key travels unencrypted. Use https://.");
     }
+}
+
+/// True when `base_url` would carry the key over plain HTTP to a host other than this
+/// machine. Read with the parser the transport uses, so userinfo, `\`, `?` or `#`
+/// cannot make a remote host look like loopback. A URL it cannot parse is left to the
+/// request, which refuses it.
+fn plain_http_to_remote(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else { return false };
+    if url.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = url.host_str() else { return false };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !(ip.is_loopback() || ip.is_unspecified()),
+        Err(_) => !host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// `base_url` for display, with any user name and password replaced by `***`.
+/// Everything between the scheme and the last '@' is hidden, so a password the URL
+/// parser does not read as one (a '/', '?', '#' or '@' in it, or no scheme) is too.
+fn redacted_base_url(base_url: &str) -> String {
+    let Some(at) = base_url.rfind('@') else { return base_url.to_string() };
+    let is_scheme = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_alphabetic())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    };
+    let start = base_url[..at]
+        .find("://")
+        .filter(|&i| is_scheme(&base_url[..i]))
+        .map_or(0, |i| i + 3);
+    format!("{}***@{}", &base_url[..start], &base_url[at + 1..])
 }
 
 /// An instant far enough out that nothing waits for it — what a deadline past the
@@ -742,37 +870,68 @@ fn far_future() -> std::time::Instant {
 /// Whether a status may be sent again, given whether the method can be replayed.
 /// 429 is refused before the request is processed, so nothing was written and any
 /// method may retry. The rest are ambiguous for a write: 408, 502, 503 and 504 can
-/// arrive after the write already landed, and a retried POST would store it twice.
-/// Those retry only when the method is idempotent.
+/// arrive after the write was applied, so they retry only when the method is
+/// idempotent. A 409 is decided from its body; see `write_lock_wait`.
 fn status_is_retryable(status: u16, idempotent: bool) -> bool {
     status == 429 || (matches!(status, 408 | 502 | 503 | 504) && idempotent)
 }
 
-/// Seconds to sleep before retry `attempt` (0-based). Honors `Retry-After`.
-fn backoff(attempt: u32, retry_after: Option<&str>) -> std::time::Duration {
-    if let Some(ra) = retry_after {
-        let ra = ra.trim();
-        if let Ok(secs) = ra.parse::<f64>() {
-            if secs >= 0.0 {
-                return std::time::Duration::from_millis((secs.min(30.0) * 1000.0) as u64);
-            }
-        }
-        // HTTP-date form (RFC 9110), e.g. "Wed, 21 Oct 2015 07:28:00 GMT".
-        if let Ok(when) = httpdate::parse_http_date(ra) {
-            if let Ok(delta) = when.duration_since(std::time::SystemTime::now()) {
-                return std::time::Duration::from_millis((delta.as_secs_f64().min(30.0) * 1000.0) as u64);
-            }
-            // A past date → retry immediately.
-            return std::time::Duration::from_millis(0);
-        }
+/// A status that leaves open whether the request was applied.
+fn status_is_ambiguous(status: u16) -> bool {
+    matches!(status, 408 | 502 | 503 | 504)
+}
+
+/// The wait before retry `attempt` (0-based). `Retry-After` counts only as
+/// delta-seconds (digits) or an HTTP-date; anything else in it falls back to the
+/// backoff. `None` when it asks for more than 30s: the caller then gets the response
+/// instead of a sleep.
+fn retry_wait(attempt: u32, retry_after: Option<&str>) -> Option<std::time::Duration> {
+    let Some(ra) = retry_after.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some(backoff(attempt));
+    };
+    if ra.bytes().all(|b| b.is_ascii_digit()) {
+        // Too many digits for u64 is still a number of seconds, and above the cap.
+        let secs = ra.parse::<u64>().unwrap_or(u64::MAX);
+        return (secs <= MAX_RETRY_WAIT.as_secs()).then(|| std::time::Duration::from_secs(secs));
     }
+    // HTTP-date form (RFC 9110), e.g. "Wed, 21 Oct 2015 07:28:00 GMT". A past date
+    // means retry now.
+    if let Ok(when) = httpdate::parse_http_date(ra) {
+        let delta = when.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+        return (delta <= MAX_RETRY_WAIT).then_some(delta);
+    }
+    Some(backoff(attempt))
+}
+
+/// The wait a 409 asks for when another write to the store was in flight: the body
+/// carries `error.retry_after_ms` and no `error.conflicts_with`. `None` for a store-id
+/// collision, which no retry can fix.
+fn write_lock_wait(text: &str) -> Option<std::time::Duration> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let err = v.get("error")?.as_object()?;
+    if err.contains_key("conflicts_with") {
+        return None;
+    }
+    let ms = err.get("retry_after_ms")?.as_f64()?;
+    if !(ms.is_finite() && ms >= 0.0) {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(ms.ceil() as u64))
+}
+
+/// Exponential backoff with jitter for retry `attempt` (0-based): 0.5s doubling to 8s.
+fn backoff(attempt: u32) -> std::time::Duration {
+    use std::hash::{BuildHasher, Hasher};
     let base = 500u64.saturating_mul(1 << attempt.min(4)).min(8_000);
-    // Cheap jitter without a rand dependency: sub-second clock noise.
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 250) as u64)
-        .unwrap_or(0);
-    std::time::Duration::from_millis(base + jitter)
+    // Jitter without a rand dependency: each RandomState has fresh random keys, so
+    // the hash differs per call even where the clock is coarse.
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    std::time::Duration::from_millis(base + h.finish() % 250)
 }
 
 /// Cap a server-controlled error message so a hostile body can't become a huge
@@ -798,9 +957,7 @@ fn cap_msg(s: String) -> String {
 ///
 /// Every line break, because `base64` and `openssl base64` wrap at 76 columns and
 /// pasting a file made that way carries the newlines into the payload. The base64
-/// alphabet has no whitespace in it. Python and TypeScript have stripped these since
-/// 2.2.31; this client did not, which is the whole reason the three were not
-/// interchangeable on the same input.
+/// alphabet has no whitespace in it.
 fn normalize_image_b64(s: &str) -> String {
     let s = s.trim();
     let body = match s.strip_prefix("data:") {
@@ -815,9 +972,8 @@ fn normalize_image_b64(s: &str) -> String {
 
 /// Normalise an `image` object in place: `{"data": ..., "reference"?, "taken_at"?}`.
 ///
-/// The byte ceiling is deliberately NOT checked. That is a server setting (`/health`
-/// reports `memory.images.max_bytes`), so a number baked into the SDK would drift the
-/// first time the service is reconfigured and would refuse an image it would have taken.
+/// Sizes are left to the service, which refuses what it cannot take: a request body
+/// over 10MB, an edge under 700px. A long edge over 1568px is downscaled, not refused.
 fn normalize_image_field(image: &mut serde_json::Value) -> Result<(), WosError> {
     let bad = |m: &str| WosError::Api { status: 400, message: m.to_string() };
     let obj = image
@@ -835,29 +991,121 @@ fn normalize_image_field(image: &mut serde_json::Value) -> Result<(), WosError> 
     Ok(())
 }
 
+/// Server text goes into error messages, and from there into logs and terminals.
+/// Control characters (C0 and DEL) are dropped so it cannot forge log lines or send
+/// escape sequences.
+fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| *c >= ' ' && *c != '\u{7f}').collect()
+}
+
 /// Server may return either the envelope
 /// `{"type":"error","error":{"type":...,"message":...,"request_id":...}}`
-/// or simple `{"error":"reason"}`. Falls back to the raw text.
+/// or simple `{"error":"reason"}`. Falls back to the raw text. A `message` that is
+/// empty or not a string falls back to `type`, then to the raw text; the request id is
+/// kept either way. The message may come back empty (an empty body).
 fn parse_error(text: &str) -> (String, Option<String>) {
+    let clean = |s: &str| cap_msg(strip_controls(s));
+    // A string that is blank once cleaned says nothing.
+    let said = |v: Option<&serde_json::Value>| {
+        v.and_then(|s| s.as_str()).map(clean).filter(|s| !s.trim().is_empty())
+    };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(err) = v.get("error") {
-            if let Some(s) = err.as_str() {
-                return (cap_msg(s.to_string()), None);
+        match v.get("error") {
+            Some(serde_json::Value::String(s)) => return (clean(s), None),
+            Some(serde_json::Value::Object(obj)) => {
+                let msg = said(obj.get("message"))
+                    .or_else(|| said(obj.get("type")))
+                    .unwrap_or_else(|| clean(text));
+                return (msg, said(obj.get("request_id")));
             }
-            if let Some(obj) = err.as_object() {
-                let msg = obj
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .or_else(|| obj.get("type").and_then(|t| t.as_str()))
-                    .map(String::from);
-                let rid = obj.get("request_id").and_then(|r| r.as_str()).map(String::from);
-                if let Some(m) = msg {
-                    return (cap_msg(m), rid);
-                }
-            }
+            _ => {}
         }
     }
-    (cap_msg(text.to_string()), None)
+    (clean(text), None)
+}
+
+/// How long a retryable answer's error body may take to arrive.
+const RETRYABLE_BODY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A non-2xx answer: the error it becomes, and whether and when it may be sent again.
+struct Refusal {
+    status: u16,
+    message: String,
+    /// The wait before another attempt, when the status allows one.
+    wait: Option<std::time::Duration>,
+}
+
+impl Refusal {
+    /// Read a non-2xx response. A body that cannot be read still yields an error with
+    /// this status, saying why: the status is the answer, so a lost body does not make
+    /// the call one to send again.
+    ///
+    /// When another attempt is expected to follow whatever the body says, the body gets
+    /// at most `RETRYABLE_BODY_WAIT` of `attempt_left`; if it has not arrived by then,
+    /// the message says so.
+    async fn read(
+        resp: reqwest::Response,
+        idempotent: bool,
+        attempt: u32,
+        more: bool,
+        deadline_at: Option<std::time::Instant>,
+        attempt_left: std::time::Duration,
+    ) -> Self {
+        let status = resp.status().as_u16();
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let planned = if status_is_retryable(status, idempotent) {
+            retry_wait(attempt, retry_after.as_deref())
+        } else {
+            None
+        };
+        let text = if more && planned.is_some_and(|d| fits_in(d, deadline_at)) {
+            let limit = RETRYABLE_BODY_WAIT.min(attempt_left);
+            tokio::time::timeout(limit, read_capped(resp)).await.unwrap_or_else(|_| {
+                Err(WosError::Api {
+                    status,
+                    message: format!("HTTP {status} (the error body could not be read: not received within {limit:?})"),
+                })
+            })
+        } else {
+            read_capped(resp).await
+        };
+        let wait = match (&text, status) {
+            (Ok(t), 409) => write_lock_wait(t).and_then(|asked| {
+                // Never shorter than the backoff, never longer than the cap.
+                let wait = asked.max(backoff(attempt));
+                (asked <= MAX_RETRY_WAIT).then_some(wait)
+            }),
+            _ if status_is_retryable(status, idempotent) => planned,
+            _ => None,
+        };
+        let message = match text {
+            Ok(t) => {
+                let (message, request_id) = parse_error(&t);
+                let message = if message.trim().is_empty() { format!("HTTP {status}") } else { message };
+                match request_id {
+                    Some(id) => format!("{message} (request_id: {id})"),
+                    None => message,
+                }
+            }
+            Err(WosError::Api { message, .. }) => message,
+            Err(e) => format!("the error body could not be read: {e}"),
+        };
+        Refusal { status, message, wait }
+    }
+
+    /// The error to return. `maybe_deleted` marks a DELETE whose earlier attempt may
+    /// have been applied, so a 404 now can mean it already happened.
+    fn into_error(self, maybe_deleted: bool) -> WosError {
+        let mut message = self.message;
+        if maybe_deleted && self.status == 404 {
+            message.push_str(" (an earlier attempt may already have deleted it)");
+        }
+        WosError::Api { status: self.status, message }
+    }
 }
 
 /// Wontopos memory client. Memories are isolated per `user_id`.
@@ -881,10 +1129,8 @@ pub struct Client {
     /// The store every call uses unless one passes `Some(user_id)`.
     default_user: String,
     timeout_secs: u64,
-    /// A TOTAL budget for one call, across every attempt. `timeout_secs` bounds one
-    /// attempt: at the defaults a call can hold for 30s + backoff + 30s + backoff +
-    /// 30s, over a minute, and a handler awaiting it had no way to say how long it
-    /// actually had. `None` means no overall budget.
+    /// A TOTAL budget for one call, across every attempt; `timeout_secs` bounds one
+    /// attempt. `None` means no overall budget.
     deadline: Option<std::time::Duration>,
     retries: u32,
     http: HttpClient,
@@ -916,15 +1162,10 @@ fn merge_results(v: &serde_json::Value) -> Vec<Memory> {
 
 /// Parse a memory array element-wise, KEEPING every valid record.
 ///
-/// A missing field or a `null` scalar inside one memory is already tolerated (see
-/// `null_to_default`), but a malformed ELEMENT — `null`, a number, a string, from a
-/// hostile server, a broken proxy, or an unfamiliar host — would fail the whole call
-/// through `from_value::<Vec<Memory>>`, letting one bad element destroy every good
-/// memory in the batch. Python and TypeScript skip the bad element and return the
-/// rest; this matches them. A missing value or non-array yields an empty vec.
-///
-/// This paragraph used to sit above `merge_results` with nothing between them, so both
-/// docs were stacked on that one function and this one had none.
+/// A missing field or a `null` scalar inside one memory is tolerated (see
+/// `null_to_default`). An element that is not an object (`null`, a number, a string)
+/// is skipped, so one bad element never costs the good memories beside it. A missing
+/// value or non-array yields an empty vec.
 fn memories_from(v: Option<&serde_json::Value>) -> Vec<Memory> {
     match v.and_then(|x| x.as_array()) {
         Some(arr) => arr
@@ -933,6 +1174,35 @@ fn memories_from(v: Option<&serde_json::Value>) -> Vec<Memory> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// The objects in the array at `v[key]`. Any element that is not an object is
+/// skipped; a missing value or non-array yields an empty vec.
+fn records(v: &serde_json::Value, key: &str) -> Vec<serde_json::Value> {
+    v.get(key)
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter(|x| x.is_object()).cloned().collect())
+        .unwrap_or_default()
+}
+
+/// The error a page walk returns when it cannot reach the end of the store. `why`
+/// says what stopped it and that the store did not end.
+fn truncated_walk(why: &str) -> WosError {
+    // 200, not 0: every page answered. This is not a failed connection.
+    WosError::Api {
+        status: 200,
+        message: format!("{why}. This is a truncated answer, not the whole store."),
+    }
+}
+
+/// A walk that reached `MAX_PAGES` pages.
+fn page_ceiling() -> WosError {
+    truncated_walk(&format!("stopped after {MAX_PAGES} pages — the store did not end"))
+}
+
+/// A walk the service answered with a cursor it had already given.
+fn repeated_cursor() -> WosError {
+    truncated_walk("the service handed back a cursor it had already given, so the store did not end")
 }
 
 /// `get` answers `{"memory": {...}}` on some models and the row itself on others.
@@ -947,11 +1217,11 @@ fn memory_from_get(v: serde_json::Value) -> serde_json::Value {
     }
 }
 
-// Never show the key — debug output ends up in logs.
+// Never show the key or base_url credentials — debug output ends up in logs.
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Client")
-            .field("base_url", &self.base_url)
+            .field("base_url", &redacted_base_url(&self.base_url))
             .field("model", &self.model)
             .field("user", &self.default_user)
             .field("api_key", &mask_key(&self.api_key))
@@ -988,7 +1258,7 @@ impl Client {
         warn_if_plain_http(base_url);
         Self {
             api_key: api_key.trim().to_string(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: base_url.trim().trim_end_matches('/').to_string(),
             model: DEFAULT_MODEL.to_string(),
             default_user: DEFAULT_USER.to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
@@ -1009,8 +1279,7 @@ impl Client {
             deadline: self.deadline,
             retries: self.retries,
             http: self.http.clone(),
-            // A derived client hasn't made a call yet — start with no snapshot, same
-            // as a fresh Python/TS client (consistency across the three SDKs).
+            // A derived client has not made a call yet, so it has no snapshot.
             rl: std::sync::Mutex::new(None),
         }
     }
@@ -1051,11 +1320,9 @@ impl Client {
     /// Where this call's budget runs out. Computed ONCE per call, never per attempt —
     /// a budget recomputed each attempt is the per-attempt timeout under another name.
     fn deadline_at(&self) -> Option<std::time::Instant> {
-        // `Instant + Duration` PANICS on overflow, so `with_deadline(Duration::MAX)` —
-        // a natural spelling of "no budget", since ZERO already means that — built fine
-        // and then aborted the caller's task on every call, from inside the SDK, where
-        // every other failure is a Result. Saturate: a budget past the clock's range is
-        // a budget that never runs out.
+        // `Instant + Duration` panics on overflow, and `with_deadline(Duration::MAX)` is a
+        // natural spelling of "no budget". Saturate: a budget past the clock's range
+        // never runs out.
         self.deadline
             .map(|d| std::time::Instant::now().checked_add(d).unwrap_or_else(far_future))
     }
@@ -1071,13 +1338,7 @@ impl Client {
         let Some(at) = deadline_at else { return Ok(per_attempt) };
         let left = at.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(WosError::Api {
-                status: 0,
-                message: format!(
-                    "deadline of {:?} exhausted",
-                    self.deadline.unwrap_or_default()
-                ),
-            });
+            return Err(self.deadline_error());
         }
         Ok(per_attempt.min(left))
     }
@@ -1092,8 +1353,9 @@ impl Client {
         c
     }
 
-    /// Return a client that retries transient failures (429/408/502/503/504 and connect
-    /// errors) `retries` times before giving up. 0 disables retries (default 2).
+    /// Return a client that retries transient failures `retries` times before giving
+    /// up: 429, a 409 for a write in flight, and 408/502/503/504 and connect errors
+    /// where a retry cannot apply a write twice. 0 disables retries (default 2).
     pub fn with_retries(&self, retries: u32) -> Self {
         let mut c = self.clone_with(None, None);
         c.retries = retries;
@@ -1104,16 +1366,8 @@ impl Client {
     fn uid(&self, user_id: Option<&str>) -> Result<String, WosError> {
         // An omitted id uses the client default — the documented shortcut. A PASSED but
         // blank id is a bug at the call site: the caller computed a tenant id and got
-        // nothing back.
-        //
-        // Falling back is not a safe default here, it is a silent redirect. 2.2.27 sent
-        // the blank string on and the server mapped it to the built-in `default` store;
-        // 2.2.28 trimmed it and so redirected the call to whatever store this client is
-        // bound to, which inside one B2B workspace means one end-user's memories land in
-        // another end-user's store and stay readable there. The warning it printed goes
-        // to stderr, which a server process usually discards.
-        //
-        // Every method here already returns Result, so reject it here.
+        // nothing back. Falling back would silently write one end user's memories into
+        // another store, so it is refused.
         if matches!(user_id, Some(u) if u.trim().is_empty()) {
             return Err(WosError::Api {
                 status: 400,
@@ -1129,10 +1383,8 @@ impl Client {
             Some(u) => u.to_string(),
             None => self.default_user.clone(),
         };
-        // The guard above only sees a PASSED id, so `with_user("")` walked around it:
-        // the blank landed in `default_user` and every later call resolved to it. The
-        // builder cannot return an error (it returns Self), so the check belongs here,
-        // on the RESOLVED id — which is the value that decides the destination anyway.
+        // The guard above only sees a PASSED id. `with_user("")` cannot return an error,
+        // so the RESOLVED id is checked here too.
         if sid.trim().is_empty() {
             return Err(WosError::Api {
                 status: 400,
@@ -1145,19 +1397,25 @@ impl Client {
         Ok(sid)
     }
 
-    /// Available models: `[{ "id", "name", "available", "memory" }, ...]`.
-    /// `memory` is `"shared"` or `"isolated"`. Needs no API key.
+    /// Available models: `[{ "id", "name", "available", "memory", "capabilities" }, ...]`.
+    /// Needs no API key. Elements that are not objects are skipped.
+    ///
+    /// `capabilities` says what the model can do (`forms`, `images`, `re_ask`,
+    /// `self_memories`, `engrams`, `speaker_names`); check it before relying on one.
+    /// `memory` is `"shared"` or `"isolated"`. Every model on the shared pool lists,
+    /// fetches and deletes the same memories, but a search may not find memories stored
+    /// through a different model, so store and search with the same one.
     pub async fn list_models(&self) -> Result<Vec<serde_json::Value>, WosError> {
         let v = self.request(reqwest::Method::GET, "/api/v1/models", None, None).await?;
-        Ok(v.get("models").and_then(|m| m.as_array()).cloned().unwrap_or_default())
+        Ok(records(&v, "models"))
     }
 
     /// The engrams (and delivery forms) the selected model can actually run.
     ///
     /// Ask rather than hard-code: a name copied from the docs freezes a caller to the
     /// catalogue as it was that day, and anything added later stays invisible. The
-    /// service is the authority, and the answer
-    /// depends on the model (delivery forms need Scroll 1.2+), so use
+    /// service is the authority, and the answer depends on the model (its
+    /// [`Client::list_models`] `capabilities` list `engrams` and `forms`), so use
     /// [`Client::with_model`] to ask about another one.
     ///
     /// Returns the whole object: `{ engrams: [...], forms: [...], note? }`. `note`
@@ -1173,13 +1431,16 @@ impl Client {
     /// Store one memory. `metadata` may be `json!({})` — or carry a speaker:
     /// `json!({"speaker": "me"})` for the assistant's own words, or a registered
     /// person's name (see [`Client::add_speaker`]).
+    ///
+    /// The service keeps four metadata keys: `speaker`, `event_date`, `category` and
+    /// `conversation_id`. Every other key is dropped, and this client warns once per
+    /// unknown key on stderr. `event_date` takes RFC3339 or a plain date (YYYY-MM-DD);
+    /// a value that is not a date is refused (400) naming the field.
     pub async fn add(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value) -> Result<serde_json::Value, WosError> {
-        check_metadata_keys(&metadata)?;
-        let user_id = self.uid(user_id.into())?;
-        self.post("/api/v1/memory/store", serde_json::json!({"user_id": user_id, "content": content, "metadata": metadata})).await
+        self.store_one(content, user_id, metadata, serde_json::json!({}), None).await
     }
 
-    /// Alias of `add` — store one memory. Same surface as the Python SDK's `store`.
+    /// Alias of `add` — store one memory.
     pub async fn store(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value) -> Result<serde_json::Value, WosError> {
         self.add(content, user_id, metadata).await
     }
@@ -1188,30 +1449,27 @@ impl Client {
     /// `json!({"image": {"data": "<base64>"}})` to store an image with the memory.
     /// Reserved fields (user_id, content, metadata) are set last so they win.
     ///
-    /// **This is where images go, and there is no `add_image`.** Python and TypeScript
-    /// take the image as one more option on the ordinary store call; a method of its
-    /// own here would have been a third shape for one request, and a new method for
-    /// every option that came after it. `recall`/`recall_with`, `search`/`search_with`
-    /// and `engram`/`engram_with` already work this way — `add` was the one that had
-    /// no way to carry an option at all.
+    /// **This is where images go; there is no `add_image`.** Images need a model whose
+    /// [`Client::list_models`] `capabilities` include `images`.
     ///
-    /// `content` may be empty: then the image is the memory and is searchable on its
-    /// own. Inside `image`, `reference` is where YOUR copy of the original lives (stored
-    /// as a string, never fetched by us), and `taken_at` (RFC3339, usually from EXIF)
-    /// fills `event_date` when that is empty, so the memory sorts by when the image
-    /// was TAKEN rather than by when it was uploaded. `image.data` is normalised on the
-    /// way through: a `data:...;base64,` prefix is dropped and all whitespace, including
-    /// the newlines a wrapped base64 file carries, is removed. Nothing else is changed —
+    /// `content` is required even with an image: it is the caption, and an empty one is
+    /// refused (400). Inside `image`, `taken_at` (RFC3339 or a plain date, YYYY-MM-DD,
+    /// usually from EXIF) fills `event_date` when that is empty, so the memory sorts by
+    /// when the image was TAKEN rather than by when it was uploaded; a value that is not
+    /// a date is refused (400) naming the field. `image.data` is normalised on the way
+    /// through: a `data:...;base64,` prefix is dropped and all whitespace, including the
+    /// newlines a wrapped base64 file carries, is removed. Nothing else is changed —
     /// URL-safe base64 is not converted, so send the standard alphabet.
     ///
-    /// Both edges must be 700px or more; a smaller image is refused (400).
+    /// `image.reference` is a string of your own (stored, never fetched). When it is
+    /// sent, the service keeps no image bytes: [`Client::get_image`] answers 404 for
+    /// that memory, and you fetch the picture from your reference.
     ///
-    /// What the service keeps is NOT your original. Over 1568px on the long edge the
-    /// picture is downscaled to 1568 on the way in, and downscaling means re-encoding:
-    /// lossless formats are written as WebP, so a PNG comes back from [`Client::get_image`]
-    /// as `image/webp`; JPEG stays JPEG. Under 1568px the bytes are untouched. This is a
-    /// memory engine, not a photo host — keep the full-resolution file yourself and put
-    /// its URL in `reference`.
+    /// Limits: the request body is at most 10MB, both edges must be 700px or more (a
+    /// smaller image is refused, 400), and a long edge over 1568px is downscaled to 1568.
+    /// Downscaling re-encodes: lossless formats are written as WebP, so a PNG comes back
+    /// from [`Client::get_image`] as `image/webp`; JPEG stays JPEG. Under 1568px the
+    /// bytes are untouched. Keep the full-resolution file yourself.
     pub async fn add_with(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value, extra: serde_json::Value) -> Result<serde_json::Value, WosError> {
         self.store_one(content, user_id, metadata, extra, None).await
     }
@@ -1243,6 +1501,7 @@ impl Client {
     ) -> Result<serde_json::Value, WosError> {
         check_metadata_keys(&metadata)?;
         let user_id = self.uid(user_id.into())?;
+        warn_on_unknown_metadata(&metadata);
         let mut obj = serde_json::Map::new();
         if let Some(e) = extra.as_object() {
             for (k, v) in e {
@@ -1281,8 +1540,10 @@ impl Client {
     ///
     /// Backfilling is what bulk ingest is FOR, and dating it is what makes the result
     /// usable: without a timestamp every memory carries the upload time, so the store
-    /// sorts wrong and an `event_from`/`event_to` search misses it. Rust has no keyword
-    /// arguments, so it arrives here, the same way `add_with` carries an image.
+    /// sorts wrong and an `event_from`/`event_to` search misses it.
+    ///
+    /// `timestamp` must be RFC3339 (`2024-03-01T10:00:00Z`). A plain date or any other
+    /// string is ignored without an error, and the memories are filed at upload time.
     ///
     /// A backfill usually wants a key as well — see
     /// [`Client::add_bulk_with_idempotent`], which takes both.
@@ -1352,11 +1613,14 @@ impl Client {
     // An `idempotency_key` makes repeating THAT EXACT write safe: the API replays the
     // first response instead of storing again (10 min), and answers 422 if the same key
     // arrives with a different body. Use it when the retry is YOURS — a job that died and
-    // was re-run, a queue that redelivers. This client retries a write on exactly one
-    // status: 429, which the service answers before it processes anything, so nothing was
-    // stored. It never retries a write on 408 / 502 / 503 / 504 or a dropped body,
-    // where the first attempt may already have landed — without a key the client
-    // cannot know whether it did.
+    // was re-run, a queue that redelivers. This client retries a write only where
+    // nothing was stored: a 429, or a 409 saying another write to the store was in
+    // flight. It never retries a write on 408 / 502 / 503 / 504 or a dropped body,
+    // where the first attempt may already have been applied — without a key the client
+    // cannot know whether it was.
+    //
+    // The key covers a retry sent after the first attempt finished. A retry that
+    // overlaps a first attempt still running can run twice.
     //
     // The key must be UNIQUE PER LOGICAL WRITE — derive it from the thing being stored
     // (`format!("import:{}", row.id)`), never a constant, or the second write replays the
@@ -1364,8 +1628,8 @@ impl Client {
     // a `with_idempotency_key()` clone: a clone invites reuse across different writes,
     // which is exactly the mistake that loses data.
     //
-    // The window lives in memory on the API, so a deploy or restart clears it early. It is
-    // a guard against a retry storm, not a durable ledger.
+    // The window is best-effort and can be shorter than 10 minutes; it is not a durable
+    // de-duplication record.
     // Format: 1-128 chars of `[A-Za-z0-9._:-]`, rejected locally before the request.
 
     /// [`Client::add`] with an idempotency key.
@@ -1397,22 +1661,16 @@ impl Client {
     /// Search stored memories. Returns them most relevant first.
     ///
     /// `limit` is 5..=20, and out of range is refused rather than clamped: asking for
-    /// 50 and silently receiving 20 reads as "that is all there is". Before 2.2.35 the
-    /// count was sent on unchecked, and a 0 was rewritten to 10 here in the client —
-    /// so a budget that computed zero was answered with ten memories, and billed.
+    /// 50 and silently receiving 20 reads as "that is all there is".
     ///
     /// `limit` bounds `memories`, not the returned `Vec`. The assistant's own words
-    /// (Scroll 1.2+) and image memories (Tablet 2+, one unless `max_images` says
-    /// otherwise) come back in it as well, so it can hold more than `limit`. They are
-    /// billed either way. Size a prompt window on what you get back, not on `limit`.
-    /// [`Client::search_full`] hands the fields back apart.
+    /// (on a model whose [`Client::list_models`] `capabilities` include
+    /// `self_memories`) and image memories (with `images`, one unless `max_images` says
+    /// otherwise) come back in it as well, so it can hold more than `limit`. Size a
+    /// prompt window on what you get back, not on `limit`. [`Client::search_full`]
+    /// hands the fields back apart.
     pub async fn search(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<Vec<Memory>, WosError> {
         let user_id = self.uid(user_id.into())?;
-        // A zero used to be rewritten to ten here, and the caller who computed it —
-        // a prompt budget that ran out — was handed ten memories and the bill for
-        // them. 2.2.35 stopped rewriting it. It is now refused instead, along with
-        // everything else outside 5..=20, which is the contract `recall` has always
-        // had and search never did.
         check_search_limit(limit)?;
         let v = self.post("/api/v1/memory/search", serde_json::json!({"user_id": user_id, "query": query, "max_results": limit})).await?;
         Ok(merge_results(&v))
@@ -1443,10 +1701,18 @@ impl Client {
     /// # Ok(()) }
     /// ```
     ///
+    /// Filters apply to `memories`. The assistant's own words (`self_memories`, merged
+    /// into the returned `Vec`) are not filtered; [`Client::search_full_with`] keeps
+    /// them apart.
+    ///
     /// Accepted filter keys: `categories`, `event_from`, `event_to`, `time_from`,
-    /// `time_to`, `min_importance`. Filtering behaves identically in every language.
-    /// Unlisted keys are dropped by the API
-    /// rather than rejected — a typo silently widens the search, so spell them exactly.
+    /// `time_to`, `min_importance`. Unlisted keys are dropped by the API rather than
+    /// rejected — a typo silently widens the search, so spell them exactly (this client
+    /// warns once per unknown key on stderr).
+    ///
+    /// The four date ends take RFC3339 or a plain date (YYYY-MM-DD). A plain end date
+    /// (`time_to`, `event_to`) covers that whole day in UTC. A value that is not a date
+    /// is refused (400) naming the field.
     pub async fn search_with(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize, extra: serde_json::Value) -> Result<Vec<Memory>, WosError> {
         let user_id = self.uid(user_id.into())?;
         // `extra` goes in first; the reserved fields are set AFTER so they win —
@@ -1462,10 +1728,8 @@ impl Client {
         obj.insert("query".into(), serde_json::json!(query));
         check_search_limit(limit)?;
         obj.insert("max_results".into(), serde_json::json!(limit));
-        // Built once. This used to clone the whole map, warn on the copy, and then
-        // rebuild from the original — a full deep copy of every request body, thrown
-        // away on the next line. `warn_on_unknown_filters` only needs a reference.
         let body = serde_json::Value::Object(obj);
+        check_max_images(&body)?;
         warn_on_unknown_filters(&body);
         let v = self.post("/api/v1/memory/search", body).await?;
         Ok(merge_results(&v))
@@ -1477,8 +1741,8 @@ impl Client {
     /// anything the API grows before this crate does. That flexibility is exactly why it
     /// cannot help with `json!({"verfy": 3})` — a typo inside a JSON literal is still a
     /// perfectly good JSON literal, so it travels to the API, is ignored as an unknown
-    /// field, and comes back 200 having changed nothing. The caller paid for a search and
-    /// believes they turned on re-asking. These fields exist so the compiler reads them.
+    /// field, and comes back 200 having changed nothing, while the caller believes they
+    /// turned on re-asking. These fields exist so the compiler reads them.
     ///
     /// ```no_run
     /// # async fn f(mem: &wontopos::Client) -> Result<(), wontopos::WosError> {
@@ -1521,9 +1785,9 @@ impl Client {
     /// # async fn run() -> Result<(), wontopos::WosError> {
     /// let mem = Client::new("wos-...");
     /// let r = mem.search_full("the day we moved", "alice", 10,
-    ///                         &SearchOpts { max_images: Some(3), verify: Some(2) }).await?;
+    ///                         &SearchOpts { max_images: Some(3), verify: Some(2), ..Default::default() }).await?;
     /// r.images.len();   // the photos, apart from the text memories
-    /// r.verify_used;    // re-ask passes that actually ran (billed per pass)
+    /// r.verify_used;    // re-ask passes that actually ran
     /// # Ok(()) }
     /// ```
     pub async fn search_full(
@@ -1533,8 +1797,43 @@ impl Client {
         limit: usize,
         opts: &SearchOpts,
     ) -> Result<SearchFull, WosError> {
+        self.search_full_with(query, user_id, limit, opts, serde_json::json!({})).await
+    }
+
+    /// [`Client::search_full`] plus extra body fields: `filters`, `speaker`,
+    /// `cache_control`, `form`, `tz`, anything [`Client::search_with`] carries. The
+    /// answer keeps `images`, `self_memories` and `verify_used` apart.
+    ///
+    /// `extra` goes in first, `opts` over it, and the reserved fields (user_id, query,
+    /// max_results) last, so forwarded JSON cannot point the search at another store.
+    /// Unknown filter keys are warned about once, as in [`Client::search_with`], and
+    /// `filters` apply to `memories`, not to `self_memories`.
+    ///
+    /// ```no_run
+    /// # use wontopos::{Client, SearchOpts};
+    /// # use serde_json::json;
+    /// # async fn run(mem: Client) -> Result<(), wontopos::WosError> {
+    /// let r = mem.search_full_with("photos from the trip", "alice", 10,
+    ///     &SearchOpts { max_images: Some(3), ..Default::default() },
+    ///     json!({"filters": {"event_from": "2026-06-01", "event_to": "2026-06-30"}})).await?;
+    /// r.images.len();
+    /// # Ok(()) }
+    /// ```
+    pub async fn search_full_with(
+        &self,
+        query: &str,
+        user_id: impl Into<Option<&str>>,
+        limit: usize,
+        opts: &SearchOpts,
+        extra: serde_json::Value,
+    ) -> Result<SearchFull, WosError> {
         let user_id = self.uid(user_id.into())?;
         let mut obj = serde_json::Map::new();
+        if let Some(e) = extra.as_object() {
+            for (k, v) in e {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
         if let Some(v) = opts.verify {
             obj.insert("verify".into(), serde_json::json!(v));
         }
@@ -1546,7 +1845,10 @@ impl Client {
         obj.insert("query".into(), serde_json::json!(query));
         check_search_limit(limit)?;
         obj.insert("max_results".into(), serde_json::json!(limit));
-        let v = self.post("/api/v1/memory/search", serde_json::Value::Object(obj)).await?;
+        let body = serde_json::Value::Object(obj);
+        check_max_images(&body)?;
+        warn_on_unknown_filters(&body);
+        let v = self.post("/api/v1/memory/search", body).await?;
         Ok(SearchFull {
             memories: memories_from(v.get("memories")),
             self_memories: memories_from(v.get("self_memories")),
@@ -1556,13 +1858,14 @@ impl Client {
         })
     }
 
-    /// Search a self-memory model (Scroll 1.2+): both fields from ONE call.
+    /// Search, with the assistant's own words kept apart: both fields from ONE call.
     ///
     /// Returns `{ memories, self_memories }` — `memories` is what others said and
     /// general memories, `self_memories` is the assistant's OWN words (stored with
     /// speaker "me"), kept apart so whoever reads them never confuses who said what.
-    /// On a model that does not keep them apart, `self_memories` is empty. Image
-    /// memories are not included; [`Client::search`] and [`Client::search_full`] carry them.
+    /// `self_memories` is empty unless the model's [`Client::list_models`]
+    /// `capabilities` include `self_memories`. Image memories are not included;
+    /// [`Client::search`] and [`Client::search_full`] carry them.
     pub async fn search_self(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<SelfSearch, WosError> {
         let user_id = self.uid(user_id.into())?;
         check_search_limit(limit)?;
@@ -1612,10 +1915,8 @@ impl Client {
         user_id: impl Into<Option<&str>>,
         opts: &RecallOpts,
     ) -> Result<RecallResponse, WosError> {
-        // ★ Checked here, where the body is built. The doc on `RecallOpts` promised
-        // "out of range is refused, not clamped" and nothing enforced it in any of the
-        // three SDKs, so `limit: 500` travelled to the engine and died there — a
-        // service error for a mistake we could see before opening a socket.
+        // Checked here, where the body is built, so an out-of-range count is refused
+        // before a socket is opened.
         let mut extra = serde_json::Map::new();
         if let Some(n) = opts.limit {
             check_search_limit(n)?;
@@ -1640,7 +1941,8 @@ impl Client {
 
     /// Like [`Client::recall`], but merges extra body fields — e.g.
     /// `json!({"form": "memoir", "tz": 9})` to render each long-term memory's time in a
-    /// delivery form (Scroll 1.2+). Reserved fields (user_id, query) are set last so they win.
+    /// delivery form (on a model whose [`Client::list_models`] `capabilities` include
+    /// `forms`). Reserved fields (user_id, query) are set last so they win.
     pub async fn recall_with(&self, query: &str, user_id: impl Into<Option<&str>>, extra: serde_json::Value) -> Result<RecallResponse, WosError> {
         let user_id = self.uid(user_id.into())?;
         let mut obj = serde_json::Map::new();
@@ -1674,8 +1976,8 @@ impl Client {
     }
 
     /// Like [`Client::search_self`], but merges extra request fields — e.g.
-    /// `json!({"form": "memoir", "tz": 9})` or `json!({"speaker": "Bob"})`. `search` had
-    /// `search_with` for this; the self variant did not — this closes that gap.
+    /// `json!({"form": "memoir", "tz": 9})` or `json!({"speaker": "Bob"})`. `filters`
+    /// apply to `memories`; `self_memories` are not filtered.
     pub async fn search_self_with(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize, extra: serde_json::Value) -> Result<SelfSearch, WosError> {
         let user_id = self.uid(user_id.into())?;
         let mut obj = serde_json::Map::new();
@@ -1688,9 +1990,8 @@ impl Client {
         obj.insert("query".into(), serde_json::json!(query));
         check_search_limit(limit)?;
         obj.insert("max_results".into(), serde_json::json!(limit));
-        // Built once — see `search_with`: cloning the map only to warn on the copy
-        // deep-copies every request body and throws it away a line later.
         let body = serde_json::Value::Object(obj);
+        check_max_images(&body)?;
         warn_on_unknown_filters(&body);
         let v = self.post("/api/v1/memory/search", body).await?;
         // Element-wise per field: corrupt elements skipped, good memories survive.
@@ -1700,11 +2001,12 @@ impl Client {
         })
     }
 
-    /// Recent conversation turns (short-term memory).
+    /// Recent conversation turns (short-term memory). Elements that are not objects
+    /// are skipped.
     pub async fn history(&self, user_id: impl Into<Option<&str>>) -> Result<Vec<serde_json::Value>, WosError> {
         let user_id = self.uid(user_id.into())?;
         let v = self.post("/api/v1/memory/history", serde_json::json!({"user_id": user_id})).await?;
-        Ok(v.get("turns").and_then(|t| t.as_array()).cloned().unwrap_or_default())
+        Ok(records(&v, "turns"))
     }
 
     /// Memory counts for a store.
@@ -1715,8 +2017,8 @@ impl Client {
 
     /// Fetch ONE memory by id — the text you stored, and its metadata.
     /// The id is what `add`/`store` or `list_memories` returned. Same visibility
-    /// as `list_memories`: an id from another store, an internal record id,
-    /// or an invalidated memory is a 404 (`ErrorKind::NotFound`).
+    /// as `list_memories`: an id from another store, an id `list_memories` does not
+    /// return, or an invalidated memory is a 404 (`ErrorKind::NotFound`).
     pub async fn get(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
         if memory_id.trim().is_empty() {
             return Err(WosError::Api {
@@ -1728,9 +2030,7 @@ impl Client {
         let v = self
             .post(
                 "/api/v1/memory/get",
-                // Validated by trimming, so send the trimmed form. Python strips before
-                // sending; an id pasted from a log with a stray space came back in one
-                // client and 404'd in the others, on a surface advertised as identical.
+                // Validated by trimming, so the trimmed form is sent.
                 serde_json::json!({"user_id": user_id, "memory_id": memory_id.trim()}),
             )
             .await?;
@@ -1738,10 +2038,12 @@ impl Client {
     }
 
     /// List a store's stored memories — the text you stored, plus its metadata.
-    /// Paginated: pass the returned `next_cursor` back as `cursor` for the
-    /// next page; a null cursor means the last page. Use it to browse or export a
-    /// store. `limit` and `cursor` accept `None` (defaults: 100, first page).
-    /// Returns `{ "memories": [...], "count", "next_cursor" }`.
+    /// Paginated: pass the returned `next_cursor` back as `cursor` for the next page,
+    /// and only a cursor the service returned. A null `next_cursor` means the last
+    /// page, but the last page can also carry one; the call after it then returns an
+    /// empty page. Use it to browse or export a store. `limit` and `cursor` accept
+    /// `None` (defaults: 100, first page). `limit` is 1 to 500; out of range is refused
+    /// before sending. Returns `{ "memories": [...], "count", "next_cursor" }`.
     pub async fn list_memories(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -1750,6 +2052,7 @@ impl Client {
     ) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         let limit = limit.into().unwrap_or(100);
+        check_list_limit(limit)?;
         let mut body = serde_json::json!({ "user_id": user_id, "limit": limit });
         if let Some(c) = cursor.into() {
             body["cursor"] = serde_json::json!(c);
@@ -1757,11 +2060,10 @@ impl Client {
         self.post("/api/v1/memory/list", body).await
     }
 
-    // ----- images (Tablet 2 and newer) -----
+    // ----- images -----
     //
-    // Storing one is not here: it is [`Client::add_with`], because an image is an
-    // option on the ordinary store call in the other two SDKs and inventing a second
-    // entry point for it here is what made the three stop matching.
+    // Images need a model whose `list_models()` capabilities include `images`. Storing
+    // one is [`Client::add_with`]: an image is an option on the ordinary store call.
 
     /// Fetch the bytes of an image memory → `(bytes, content_type)`.
     ///
@@ -1769,17 +2071,16 @@ impl Client {
     /// in format. An image whose long edge was over 1568px was downscaled to 1568 on the
     /// way in and re-encoded (lossless formats as WebP, so a PNG comes back as
     /// `image/webp`; JPEG stays JPEG), and that smaller picture is what is stored and
-    /// comes back here. Nothing on our side ever uses more than 1568, so the extra
-    /// pixels would be bytes nobody reads. Keep your own copy if you need the
-    /// full-resolution file.
+    /// comes back here. Keep your own copy if you need the full-resolution file.
     ///
     /// The type is sniffed from the BYTES, not from whatever the upload was named, so
     /// take the file extension from the returned type rather than from what you sent.
-    /// When the format changed, the response also carries an
-    /// `x-wos-image-converted-from` header naming what you uploaded.
-    /// Answers `NotFound` when the memory has no image, or when this service keeps no
-    /// image bytes at all — it says "no" rather than handing back something
-    /// empty, so "a memory with no image" never looks like "an image we lost".
+    ///
+    /// Answers `NotFound` when the memory has no image, when it was stored with
+    /// `image.reference` (the service then keeps no bytes; fetch it from your own
+    /// reference), or when this service keeps no image bytes at all. It says "no"
+    /// rather than handing back something empty, so "a memory with no image" never
+    /// looks like "an image we lost".
     pub async fn get_image(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -1802,9 +2103,9 @@ impl Client {
 
     /// Remove the IMAGE from a memory, keeping its text.
     ///
-    /// Except when there is no text: an image stored without a caption *is* the memory, so
-    /// deleting the image deletes it. Pass `preview = true` to find out first — it
-    /// reports `memory_kept` and changes nothing.
+    /// Pass `preview = true` to see the outcome first: it reports `memory_kept` and
+    /// changes nothing. Without a preview, a 404 after an attempt that may have been
+    /// applied ends with "(an earlier attempt may already have deleted it)".
     pub async fn forget_image(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -1823,15 +2124,17 @@ impl Client {
         if preview {
             body["preview"] = serde_json::json!(true);
         }
-        self.request(reqwest::Method::DELETE, "/api/v1/memory/image", Some(&body), None).await
+        // A preview deletes nothing, so a 404 there never says it may already be gone.
+        self.send(reqwest::Method::DELETE, "/api/v1/memory/image", Some(&body), None, None, !preview).await
     }
 
     /// One page of image memories, newest first, plus the store's TOTAL `count`.
     ///
-    /// `count` is the total, not the size of the page. Paging is by cursor: hand
-    /// `next_before` and `next_skip_ids` back as `before` / `skip_ids`. Both are needed
-    /// because several images can share a timestamp, and a timestamp alone would either
-    /// repeat them or skip them.
+    /// `count` is the total, not the size of the page. `limit` is 5 to 20; out of range
+    /// is refused before sending. Paging is by cursor: hand `next_before` and
+    /// `next_skip_ids` back as `before` / `skip_ids`. Both are needed because several
+    /// images can share a timestamp, and a timestamp alone would either repeat them or
+    /// skip them.
     pub async fn list_images(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -1842,6 +2145,7 @@ impl Client {
         let user_id = self.uid(user_id.into())?;
         let mut body = serde_json::json!({ "user_id": user_id });
         if let Some(l) = limit.into() {
+            check_page_limit("limit", l)?;
             body["limit"] = serde_json::json!(l);
         }
         if let Some(b) = before.into() {
@@ -1858,10 +2162,13 @@ impl Client {
     ///
     /// Rust has no async generator in the stable language, so this collects and
     /// returns. Reach for `list_images` when a store is big enough that holding every
-    /// image row at once matters.
+    /// image row at once matters. `page_size` is 5 to 20; out of range is refused before
+    /// sending.
     ///
     /// This walks ROWS, not pixels — the bytes come from [`Client::get_image`] one at a
     /// time. A thousand images here is a thousand small JSON records, not a thousand JPEGs.
+    /// Elements that are not objects are skipped. A cursor that comes back after a page
+    /// with rows in it, or the page ceiling, is an error rather than a short list.
     pub async fn list_all_images(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -1869,12 +2176,13 @@ impl Client {
     ) -> Result<Vec<serde_json::Value>, WosError> {
         let user_id = self.uid(user_id.into())?;
         let page_size = page_size.into();
+        if let Some(n) = page_size {
+            check_page_limit("page_size", n)?;
+        }
         let mut out: Vec<serde_json::Value> = Vec::new();
         let mut before: Option<String> = None;
         let mut skip_ids: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Backstop, same reason as `list_all_memories`: a server that keeps saying
-        // "there is more" forever must not turn a browse into an infinite loop.
         // Rust has no `for … else`, so the legitimate exits say so.
         let mut ended = false;
         for _ in 0..MAX_PAGES {
@@ -1889,51 +2197,39 @@ impl Client {
                 body["skip_ids"] = serde_json::json!(skip_ids);
             }
             let page = self.post("/api/v1/memory/images", body).await?;
-            if let Some(arr) = page.get("images").and_then(|m| m.as_array()) {
-                out.extend(arr.iter().cloned());
-            }
+            let rows = records(&page, "images");
+            let had_rows = !rows.is_empty();
+            out.extend(rows);
             if !page.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false) {
-                {
-                    ended = true;
-                    break;
-                }
+                ended = true;
+                break;
             }
-            let Some(next_before) = page.get("next_before").and_then(|v| v.as_str()) else {
-                {
-                    ended = true;
-                    break;
-                }
+            let Some(next_before) = page.get("next_before").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            else {
+                ended = true;
+                break;
             };
             let next_skip: Vec<String> = page
                 .get("next_skip_ids")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            // The image cursor is not `before` alone, it is **the pair `before` and
-            //  `skip_ids`**. Several images can share a timestamp, so a timestamp on its
-            //  own either skips them or repeats them. Progress has to be judged on the
-            //  pair too: comparing `before` alone reads "nothing moved" while walking a
-            //  group that shares one timestamp, and stops there.
+            // The image cursor is the PAIR `before` and `skip_ids`: several images can
+            // share a timestamp, so `before` alone does not move while a group that
+            // shares one is walked. Progress is judged on the pair.
             let key = format!("{next_before}|{}", next_skip.join(","));
             if !seen.insert(key) {
-                {
-                    ended = true;
-                    break;
+                if had_rows {
+                    return Err(repeated_cursor());
                 }
+                ended = true;
+                break;
             }
             before = Some(next_before.to_string());
             skip_ids = next_skip;
         }
         if !ended {
-            // 200, not 0: every page answered. This is a local ceiling, not a
-            // failed connection.
-            return Err(WosError::Api {
-                status: 200,
-                message: format!(
-                    "stopped after {MAX_PAGES} pages — the store did not end. This is a \
-truncated answer, not the whole store."
-                ),
-            });
+            return Err(page_ceiling());
         }
         Ok(out)
     }
@@ -1972,7 +2268,7 @@ truncated answer, not the whole store."
     /// Aimed at the MODEL rather than at the developer: an assistant leaning on its own
     /// memory should be able to ask how far that memory has been edited underneath it.
     /// Returns `revised` / `unrevised` / `total`, plus a plain-language `counts` and
-    /// `excludes`.
+    /// `excludes`. `total` counts the memories you stored.
     ///
     /// COUNTS ONLY, and the answer is the same size for a store of a hundred memories
     /// and a store of a hundred million. That is the point: a model asks this
@@ -1982,12 +2278,9 @@ truncated answer, not the whole store."
     /// because of a default nobody chose.
     ///
     /// Counts memories a transform touched (supersede, update, retract, image removed).
-    /// Deletions are NOT counted — a deleted memory leaves nothing to count. Neither are
-    /// the internal records derived from what you stored: nobody stored those, so they
-    /// do not belong in a ratio that answers "how much of MY memory changed".
-    /// Served from `/api/v1/won/*`, not `/api/v1/memory/*`. Won is the surface for
-    /// calls a model makes ABOUT its memory rather than calls an application makes WITH
-    /// it. The old path still answers, and both share one rate-limit budget.
+    /// Deletions are NOT counted — a deleted memory leaves nothing to count.
+    /// Served from `/api/v1/won/*`, the surface for calls a model makes ABOUT its
+    /// memory rather than calls an application makes WITH it.
     pub async fn revisions(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -2037,11 +2330,9 @@ truncated answer, not the whole store."
     /// Paging is by cursor, like [`Client::list_images`]: hand `next_before` and
     /// `next_skip_ids` back as `before` / `skip_ids`. Both are needed because several
     /// memories can share a timestamp, and a timestamp alone would repeat or skip them.
+    /// `limit` is 5 to 20; out of range is refused before sending.
     ///
-    /// TypeScript and Python spell this as options on `revisions` itself. Rust takes
-    /// positional arguments, so folding four of them into the counts call would make the
-    /// cheap question look as expensive as the expensive one — and would have broken
-    /// every existing `revisions(user_id)` call site.
+    /// A separate method, so the counts call stays the cheap question it is.
     ///
     /// Pages are ordered by when each memory was STORED, not by when it was edited.
     /// The response says which in `ordered_by`.
@@ -2061,8 +2352,8 @@ truncated answer, not the whole store."
     ///         println!("{}", m["content"]);
     ///     }
     ///     // Both, not just `has_more`: a page that says there is more but carries no
-    ///     // cursor would set `before` back to None, and the engine reads that as "no
-    ///     // cursor" — page one, forever, without a single error.
+    ///     // cursor would set `before` back to None, which reads as "no cursor" —
+    ///     // page one, forever, without a single error.
     ///     let next = p["next_before"].as_str().map(str::to_string);
     ///     if !p["has_more"].as_bool().unwrap_or(false) || next.is_none() {
     ///         break;
@@ -2087,6 +2378,7 @@ truncated answer, not the whole store."
         let user_id = self.uid(user_id.into())?;
         let mut body = serde_json::json!({ "user_id": user_id, "include": include });
         if let Some(l) = limit.into() {
+            check_page_limit("limit", l)?;
             body["limit"] = serde_json::json!(l);
         }
         if let Some(b) = before.into() {
@@ -2123,7 +2415,8 @@ truncated answer, not the whole store."
     /// What one person said, newest first.
     ///
     /// `speaker` is the tag written at store time — `"me"` for the assistant's own words,
-    /// otherwise a person's name. Same cursor paging as `list_images`.
+    /// otherwise a person's name. Same cursor paging as `list_images`; `limit` is 5 to
+    /// 20, and out of range is refused before sending.
     ///
     /// `points_to_delete` is the count to show before anyone confirms a delete of this
     /// speaker's memories.
@@ -2144,6 +2437,7 @@ truncated answer, not the whole store."
         }
         let mut body = serde_json::json!({ "user_id": user_id, "speaker": speaker.trim() });
         if let Some(l) = limit.into() {
+            check_page_limit("limit", l)?;
             body["limit"] = serde_json::json!(l);
         }
         if let Some(b) = before.into() {
@@ -2158,6 +2452,9 @@ truncated answer, not the whole store."
     /// Fetch EVERY memory in a store, paging under the hood — the text you stored, and
     /// its metadata. Returns them all. `list_memories` is the one-page primitive; this is
     /// the "give me the whole store" convenience (browse / export).
+    ///
+    /// Elements that are not objects are skipped. A cursor that comes back after a page
+    /// with rows in it, or the page ceiling, is an error rather than a short list.
     pub async fn list_all_memories(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -2166,9 +2463,8 @@ truncated answer, not the whole store."
         let mut out: Vec<serde_json::Value> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Backstop: the cursor-repeat guard catches a repeated cursor, but not a
-        // server that mints a FRESH cursor every page forever — bound the walk.
-        // Rust has no `for … else`, so the legitimate exits say so.
+        // The ceiling bounds a server that mints a FRESH cursor every page. Rust has no
+        // `for … else`, so the legitimate exits say so.
         let mut ended = false;
         for _ in 0..MAX_PAGES {
             let mut body = serde_json::json!({ "user_id": user_id, "limit": 100 });
@@ -2176,41 +2472,37 @@ truncated answer, not the whole store."
                 body["cursor"] = serde_json::json!(c);
             }
             let page = self.post("/api/v1/memory/list", body).await?;
-            if let Some(arr) = page.get("memories").and_then(|m| m.as_array()) {
-                out.extend(arr.iter().cloned());
-            }
+            let rows = records(&page, "memories");
+            let had_rows = !rows.is_empty();
+            out.extend(rows);
             let next = page
                 .get("next_cursor")
                 .and_then(|c| c.as_str())
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            // Stop on the last page OR a server that repeats a cursor (else infinite loop).
             match next {
-                Some(c) if seen.insert(c.clone()) => cursor = Some(c),
-                _ => {
+                None => {
                     ended = true;
                     break;
+                }
+                Some(c) if seen.insert(c.clone()) => cursor = Some(c),
+                // A cursor seen before, after an empty page: nothing is left.
+                Some(_) if !had_rows => {
+                    ended = true;
+                    break;
+                }
+                Some(_) => {
+                    return Err(repeated_cursor())
                 }
             }
         }
         if !ended {
-            // 200, not 0: every page answered. This is a local ceiling, not a
-            // failed connection.
-            return Err(WosError::Api {
-                status: 200,
-                message: format!(
-                    "stopped after {MAX_PAGES} pages — the store did not end. This is a \
-truncated answer, not the whole store."
-                ),
-            });
+            return Err(page_ceiling());
         }
         Ok(out)
     }
 
-    /// Every memory in a store — the cross-language name for [`Client::list_all_memories`].
-    ///
-    /// Python and TypeScript call this `export_memories` / `exportMemories`, and that
-    /// is the name the published docs advertise, so a Rust reader following them hit a
-    /// method that did not exist. Same behaviour, both names kept.
+    /// Every memory in a store; the same as [`Client::list_all_memories`].
     pub async fn export_memories(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -2232,7 +2524,9 @@ truncated answer, not the whole store."
     /// explicit: a store must exist before you `add` to or `search` it, otherwise
     /// those calls return 404. Idempotent. Every account starts with a `default`
     /// store. Returns `{ "user_id", "status" }` (`status` is `"created"`/`"exists"`), plus
-    /// `canonical_id` and `note` when the id is filed under a normalized form.
+    /// `canonical_id` and `note` when the id is filed under a normalized form. An id that
+    /// collides with an existing store once punctuation is folded is refused (409,
+    /// `ErrorKind::Conflict`) and never retried.
     pub async fn create_store(&self, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         self.post("/api/v1/memory/collection", serde_json::json!({ "user_id": user_id })).await
@@ -2240,13 +2534,16 @@ truncated answer, not the whole store."
 
     /// List your stores: `[{ "user_id", "created_at", "canonical_id"? }, ...]`
     /// (`default` first). Each `user_id` is the id the store was created with;
-    /// `canonical_id` appears when the normalized form differs.
+    /// `canonical_id` appears when the normalized form differs. Elements that are not
+    /// objects are skipped.
     pub async fn list_stores(&self) -> Result<Vec<serde_json::Value>, WosError> {
         let v = self.request(reqwest::Method::GET, "/api/v1/memory/collections", None, None).await?;
-        Ok(v.get("collections").and_then(|c| c.as_array()).cloned().unwrap_or_default())
+        Ok(records(&v, "collections"))
     }
 
     /// Delete a store and ALL its memories. Returns `{ "user_id", "status" }`.
+    /// A 404 after an attempt that may have been applied ends with "(an earlier
+    /// attempt may already have deleted it)".
     pub async fn delete_store(&self, user_id: &str) -> Result<serde_json::Value, WosError> {
         warn_if_store_id_collapses(user_id); // destructive: warn here too
         if user_id.trim().is_empty() {
@@ -2276,7 +2573,9 @@ truncated answer, not the whole store."
         self.request(reqwest::Method::GET, "/api/v1/memory/speakers", None, Some(&query)).await
     }
 
-    /// Unregister a person. Their memories stay; the name tag goes.
+    /// Unregister a person. Their memories stay; the name tag goes. A 404 after an
+    /// attempt that may have been applied ends with "(an earlier attempt may already
+    /// have deleted it)".
     pub async fn remove_speaker(&self, speaker: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         let body = serde_json::json!({"user_id": user_id, "speaker": speaker});
@@ -2289,11 +2588,8 @@ truncated answer, not the whole store."
     pub async fn delete(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
         // Guard: without a memory_id the API's forget endpoint means "delete the
         // whole store". An empty id slipping in here must never become a wipe.
-        //
-        // Trimming matters as much as the emptiness test: "   " is not empty, so it used
-        // to pass and travel as memory_id. A server that trims it back to nothing reads
-        // the request as the whole-store form. `delete_all` below already trimmed; the
-        // more dangerous path was the one that did not.
+        // Trimmed first: "   " would otherwise pass, and a server that trims it reads
+        // the whole-store form.
         let memory_id = memory_id.trim();
         if memory_id.is_empty() {
             return Err(WosError::Api {
@@ -2308,8 +2604,8 @@ truncated answer, not the whole store."
     /// Delete ALL memories for a store (GDPR erase). `user_id` is required on purpose -
     /// this is destructive, so it never falls back to the default store.
     pub async fn delete_all(&self, user_id: &str) -> Result<serde_json::Value, WosError> {
-        // Destructive calls take the id directly instead of going through uid(), so the
-        // collision warning never fired on the two that ERASE data.
+        // Destructive calls take the id directly rather than through uid(), so they
+        // warn here.
         warn_if_store_id_collapses(user_id);
         if user_id.trim().is_empty() {
             return Err(WosError::Api {
@@ -2322,13 +2618,34 @@ truncated answer, not the whole store."
 
     // ----- internal -----
 
-    /// The key checks, in one place both request paths reach.
-    ///
-    /// They used to live inside `request_with_key`, which `request_bytes` does not go
-    /// through — it builds its own request and sets the header directly. So
-    /// `Client::new("").get_image(..)` still sent an empty header and failed at the
-    /// network as the mystery 401 these checks exist to prevent, on the one route the
-    /// README named without qualification.
+    /// The checks every request makes before it opens a socket.
+    fn preflight(&self) -> Result<(), WosError> {
+        if !valid_model(&self.model) {
+            return Err(WosError::Api {
+                status: 400,
+                message: format!(
+                    "invalid model name: {:?} (letters, digits, '.', '_', '-' only)",
+                    self.model
+                ),
+            });
+        }
+        self.check_api_key()?;
+        // Inside the URL, the parser drops tabs and newlines and reads `\` as `/`, so the
+        // host a request reaches is not the one the string shows.
+        if self.base_url.chars().any(|c| c == '\\' || c.is_whitespace() || c.is_control()) {
+            return Err(invalid_base_url("it contains whitespace, a backslash or a control character"));
+        }
+        // `http://` with no host would otherwise become `http:/api/...`, which the
+        // URL parser reads as host `api`.
+        if let Err(e) = reqwest::Url::parse(&self.base_url) {
+            return Err(invalid_base_url(&e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// The key is trimmed at construction, so anything left that is not a plain
+    /// ASCII token is a paste error, refused here rather than sent and answered 401.
+    /// Empty is checked here because `new` and `with_base_url` are infallible.
     fn check_api_key(&self) -> Result<(), WosError> {
         // `is_whitespace` is false for "", so emptiness has to be its own check.
         if self.api_key.is_empty() {
@@ -2363,6 +2680,23 @@ truncated answer, not the whole store."
         Ok(())
     }
 
+    /// The error for a budget that ran out with no response to report.
+    fn deadline_error(&self) -> WosError {
+        WosError::Api {
+            status: 0,
+            message: format!("deadline of {:?} exhausted", self.deadline.unwrap_or_default()),
+        }
+    }
+
+    /// Keep the quota from a response's headers; `rate_limit()` reports the latest.
+    fn record_rate_limit(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(rl) = parse_rate_limit(headers) {
+            if let Ok(mut g) = self.rl.lock() {
+                *g = Some(rl);
+            }
+        }
+    }
+
     /// One request that answers with BYTES rather than JSON.
     ///
     /// Only `/memory/image` does this, and it is why it cannot go through `request`:
@@ -2372,94 +2706,99 @@ truncated answer, not the whole store."
     /// Errors still arrive as JSON, so a non-2xx is decoded the same way as everywhere
     /// else and keeps `NotFound` / auth failures behaving identically.
     ///
-    /// Retries 429 and connect-level failures, like every other call. A retry AFTER
-    /// bytes have arrived would pay for the body twice; neither of these is that —
-    /// a 429 carries no image, and a connect failure never reached the server.
+    /// Retries 429, a 409 for a write in flight, and connect-level failures, like
+    /// every other call. None of those carries an image, and a connect failure never
+    /// reached the server.
     async fn request_bytes(
         &self,
         path: &str,
         body: &serde_json::Value,
     ) -> Result<(Vec<u8>, String), WosError> {
-        self.check_api_key()?;
+        self.preflight()?;
         let url = format!("{}{}", self.base_url, path);
         let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
+        let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
+        // The answer that led to this attempt, reported if the budget runs out first.
+        let mut last_refusal: Option<Refusal> = None;
         let mut attempt: u32 = 0;
-        let resp = loop {
+        let (resp, budget, previous) = loop {
+            let start = std::time::Instant::now();
+            let previous = last_refusal.take();
+            let budget = match self.attempt_budget(deadline_at) {
+                Ok(b) => b,
+                Err(e) => return Err(previous.map_or(e, |r| r.into_error(false))),
+            };
             let sent = self
                 .http
                 .post(&url)
                 .header("X-API-Key", &self.api_key)
                 .header("X-WOS-Model", &self.model)
                 .json(body)
-                .timeout(self.attempt_budget(deadline_at)?)
+                .timeout(budget)
                 .send()
                 .await;
             let r = match sent {
                 Ok(r) => r,
+                Err(e) if e.is_builder() => return Err(builder_error(e)),
                 Err(e) => {
-                    // A connect-level failure never reached the server, so re-sending
-                    // cannot double-anything — and that includes a CONNECT timeout, which
-                    // reqwest reports with both predicates true. Excluding every timeout
-                    // here dropped exactly the case the JSON path retries. The ambiguous
-                    // one is a timeout AFTER the request went out, and that arrives as
-                    // is_timeout() without is_connect().
+                    // The deadline ran out mid-attempt: report the answer before it, or
+                    // that the deadline ran out.
+                    if ran_out_of_budget(&e, budget, per_attempt) {
+                        return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+                    }
+                    // A connect-level failure never reached the server, so it can be sent
+                    // again. That includes a CONNECT timeout, which reports both
+                    // predicates; a timeout after the request went out is not retried.
                     if e.is_connect() && attempt + 1 < attempts {
-                        let delay = backoff(attempt, None);
-                        tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
+                        let delay = backoff(attempt);
+                        if !fits_in(delay, deadline_at) {
+                            return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+                        }
+                        tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(WosError::Network(e));
+                    return Err(network_error(e));
                 }
             };
-            // 429 carries no image and is refused before any processing, so retrying it
-            // is always safe.
-            if r.status().as_u16() == 429 && attempt + 1 < attempts {
-                let ra = r.headers().get("retry-after").and_then(|v| v.to_str().ok()).map(str::to_string);
-                let delay = backoff(attempt, ra.as_deref());
-                tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
-                attempt += 1;
-                continue;
+            let status = r.status();
+            if status.is_redirection() {
+                return Err(WosError::Api {
+                    status: status.as_u16(),
+                    message: "unexpected redirect — refused (the API key never follows a redirect). Check base_url: exact host, https://.".into(),
+                });
             }
-            break r;
+            self.record_rate_limit(r.headers());
+            if !status.is_success() {
+                let left = budget.saturating_sub(start.elapsed());
+                let refusal = Refusal::read(r, false, attempt, attempt + 1 < attempts, deadline_at, left).await;
+                if let Some(delay) = refusal.wait {
+                    if attempt + 1 < attempts && fits_in(delay, deadline_at) {
+                        last_refusal = Some(refusal);
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                return Err(refusal.into_error(false));
+            }
+            break (r, budget, previous);
         };
-        // The quota this call just spent. rate_limit() promises the MOST RECENT call and
-        // this route never wrote to it, so an image loop self-throttling on it read a
-        // snapshot frozen at whatever JSON call came before — or None forever.
-        if let Some(rl) = parse_rate_limit(resp.headers()) {
-            if let Ok(mut g) = self.rl.lock() {
-                *g = Some(rl);
-            }
-        }
-        let status = resp.status();
-        if status.is_redirection() {
-            return Err(WosError::Api {
-                status: status.as_u16(),
-                message: "unexpected redirect — refused (the API key never follows a redirect). Check base_url: exact host, https://.".into(),
-            });
-        }
-        if !status.is_success() {
-            // Through the cap, not `resp.text()`. The SUCCESS body was streamed and
-            // bounded at 64MB while the ERROR body on the same route was collected
-            // whole — so a base_url that answers 500 and then streams indefinitely
-            // could exhaust memory on the one route the module doc says is capped.
-            let text = read_capped(resp).await.unwrap_or_default();
-            let (message, request_id) = parse_error(&text);
-            let message = match request_id {
-                Some(id) => format!("{message} (request_id: {id})"),
-                None => message,
-            };
-            return Err(WosError::Api { status: status.as_u16(), message });
-        }
         let ctype = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let status = status.as_u16();
-        let bytes = read_capped_bytes(resp).await?;
+        let status = resp.status().as_u16();
+        let bytes = match read_capped_bytes(resp).await {
+            Ok(b) => b,
+            Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
+                return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+            }
+            Err(e) => return Err(e),
+        };
         if bytes.is_empty() {
             // An empty 200 would otherwise read as "here is your image" and write a
             // zero-byte file — indistinguishable from an image we lost.
@@ -2468,7 +2807,7 @@ truncated answer, not the whole store."
                 message: "empty image body — the service returned no bytes".into(),
             });
         }
-        Ok((bytes.to_vec(), ctype))
+        Ok((bytes, ctype))
     }
 
     async fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, WosError> {
@@ -2491,7 +2830,7 @@ truncated answer, not the whole store."
 
     /// `request`, plus an optional `Idempotency-Key`. The key rides on EVERY attempt of
     /// this call — that is the point: if a retry ever does happen, the API replays the
-    /// first response instead of storing twice.
+    /// first response instead of applying the write again.
     async fn request_with_key(
         &self,
         method: reqwest::Method,
@@ -2499,6 +2838,21 @@ truncated answer, not the whole store."
         body: Option<&serde_json::Value>,
         query: Option<&[(&str, String)]>,
         idempotency_key: Option<&str>,
+    ) -> Result<serde_json::Value, WosError> {
+        let removes = method == reqwest::Method::DELETE;
+        self.send(method, path, body, query, idempotency_key, removes).await
+    }
+
+    /// The request loop. `removes` marks a call that deletes something, so a 404 after
+    /// an attempt that may have been applied can say it may already be gone.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        query: Option<&[(&str, String)]>,
+        idempotency_key: Option<&str>,
+        removes: bool,
     ) -> Result<serde_json::Value, WosError> {
         if let Some(k) = idempotency_key {
             if !valid_idempotency_key(k) {
@@ -2510,38 +2864,30 @@ truncated answer, not the whole store."
                 });
             }
         }
-        if !valid_model(&self.model) {
-            return Err(WosError::Api {
-                status: 400,
-                message: format!(
-                    "invalid model name: {:?} (letters, digits, '.', '_', '-' only)",
-                    self.model
-                ),
-            });
-        }
-        // Key hygiene (parity with the Python/TS SDKs): the key is trimmed at
-        // construction, so any REMAINING whitespace is a paste error mid-key —
-        // sent as-is it reads back as a mystery 401 (or fails header build).
-        // Empty is checked here rather than at construction because `new` and
-        // `with_base_url` are infallible by design. `Client::new(&env::var("KEY")
-        // .unwrap_or_default())` with the variable unset otherwise produced a usable
-        // client that sent an empty header and failed at the network as a 401 —
-        // Python and TypeScript both refuse it at the call site that made the mistake.
-        // `is_whitespace` is false for "", so this had to be its own check.
-        self.check_api_key()?;
+        self.preflight()?;
         let url = format!("{}{}", self.base_url, path);
-        // `+ 1` overflowed for with_retries(u32::MAX): debug panicked, release wrapped to
-        // 0, and `attempt + 1 < attempts` was then never true — "retry as hard as you can"
-        // silently became "do not retry".
+        // Saturating: `with_retries(u32::MAX)` means "retry as hard as you can", and a
+        // wrapped count would mean "do not retry".
         let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
+        let idempotent = method.is_idempotent();
+        // Set once an attempt ended without saying whether it was applied.
+        let mut maybe_applied = false;
+        let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
+        // The answer that led to this attempt, reported if the budget runs out first.
+        let mut last_refusal: Option<Refusal> = None;
         let mut attempt: u32 = 0;
         loop {
             let start = std::time::Instant::now();
+            let previous = last_refusal.take();
+            let budget = match self.attempt_budget(deadline_at) {
+                Ok(b) => b,
+                Err(e) => return Err(previous.map_or(e, |r| r.into_error(removes && maybe_applied))),
+            };
             let mut req = self
                 .http
                 .request(method.clone(), &url)
-                .timeout(self.attempt_budget(deadline_at)?)
+                .timeout(budget)
                 .header("X-API-Key", &self.api_key)
                 .header("X-WOS-Model", &self.model);
             if let Some(k) = idempotency_key {
@@ -2555,52 +2901,77 @@ truncated answer, not the whole store."
             }
             let resp = match req.send().await {
                 Ok(r) => r,
+                Err(e) if e.is_builder() => return Err(builder_error(e)),
                 Err(e) => {
-                    // Retry only when a retry cannot double-process a write:
+                    // The deadline ran out mid-attempt. A read reports the answer before
+                    // it; otherwise the caller hears that the deadline ran out.
+                    if ran_out_of_budget(&e, budget, per_attempt) {
+                        return Err(match previous.filter(|_| idempotent) {
+                            Some(r) => r.into_error(removes),
+                            None => self.deadline_error(),
+                        });
+                    }
+                    // Retry only when a retry cannot apply a write twice:
                     //   · a connect-level failure — the request never reached the server
                     //   · an idempotent method — re-running it changes nothing
-                    // Timeouts are excluded from BOTH: they are ambiguous (the write may
-                    // have landed), and re-sending would bill it twice.
-                    let safe = e.is_connect() || (method.is_idempotent() && !e.is_timeout());
+                    // Timeouts are excluded from both: the write may already have been
+                    // applied.
+                    let safe = e.is_connect() || (idempotent && !e.is_timeout());
                     if safe && attempt + 1 < attempts {
-                        let delay = backoff(attempt, None);
+                        let delay = backoff(attempt);
+                        if !fits_in(delay, deadline_at) {
+                            return Err(previous.map_or_else(
+                                || self.deadline_error(),
+                                |r| r.into_error(removes && maybe_applied),
+                            ));
+                        }
                         log_debug!(
                             "{method} {path}: {} — retrying in {}ms (attempt {}/{attempts})",
                             if e.is_connect() { "connect error" } else { "transport error" },
                             delay.as_millis(),
                             attempt + 1
                         );
-                        tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
+                        maybe_applied |= !e.is_connect();
+                        tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
                     }
-                    return Err(WosError::Network(e));
+                    return Err(network_error(e));
                 }
             };
             let status = resp.status();
-            let retryable = status_is_retryable(status.as_u16(), method.is_idempotent());
-            if retryable && attempt + 1 < attempts {
-                let ra = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                let delay = backoff(attempt, ra.as_deref());
-                log_debug!(
-                    "{method} {path} -> {} — retrying in {}ms (attempt {}/{attempts})",
-                    status.as_u16(),
-                    delay.as_millis(),
-                    attempt + 1
-                );
-                tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
-                attempt += 1;
-                continue;
-            }
             if status.is_redirection() {
                 return Err(WosError::Api {
                     status: status.as_u16(),
                     message: "unexpected redirect — refused (the API key never follows a redirect). Check base_url: exact host, https://.".into(),
                 });
+            }
+            self.record_rate_limit(resp.headers());
+            if !status.is_success() {
+                let left = budget.saturating_sub(start.elapsed());
+                let refusal = Refusal::read(resp, idempotent, attempt, attempt + 1 < attempts, deadline_at, left).await;
+                if let Some(delay) = refusal.wait {
+                    if attempt + 1 < attempts && fits_in(delay, deadline_at) {
+                        log_debug!(
+                            "{method} {path} -> {} — retrying in {}ms (attempt {}/{attempts})",
+                            status.as_u16(),
+                            delay.as_millis(),
+                            attempt + 1
+                        );
+                        maybe_applied |= status_is_ambiguous(status.as_u16());
+                        last_refusal = Some(refusal);
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue;
+                    }
+                }
+                log_debug!(
+                    "{method} {path} -> {} in {}ms (attempt {}/{attempts})",
+                    status.as_u16(),
+                    start.elapsed().as_millis(),
+                    attempt + 1
+                );
+                return Err(refusal.into_error(removes && maybe_applied));
             }
             // Surface whether the write was stored or replayed. The server says so with
             // `Idempotent-Replayed: true`. Read it before `read_capped`, which consumes
@@ -2611,30 +2982,38 @@ truncated answer, not the whole store."
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v == "true")
                 .unwrap_or(false);
-            if let Some(rl) = parse_rate_limit(resp.headers()) {
-                if let Ok(mut g) = self.rl.lock() {
-                    *g = Some(rl);
-                }
-            }
             // A drop WHILE READING the body is not a connect error — `send()` already
             // returned, so it surfaces here and nowhere else. Same rule as above: an
             // idempotent read can be re-run safely, a write cannot (it may already have
-            // landed before the connection died). A timeout stays unretried either way.
+            // been applied). A timeout stays unretried either way.
             let text = match read_capped(resp).await {
                 Ok(t) => t,
+                Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
+                    return Err(match previous.filter(|_| idempotent) {
+                        Some(r) => r.into_error(removes),
+                        None => self.deadline_error(),
+                    });
+                }
                 Err(e) => {
                     let retry_body = match &e {
-                        WosError::Network(ne) => method.is_idempotent() && !ne.is_timeout(),
+                        WosError::Network(ne) => idempotent && !ne.is_timeout(),
                         _ => false, // the size cap and friends are not transport failures
                     };
                     if retry_body && attempt + 1 < attempts {
-                        let delay = backoff(attempt, None);
+                        let delay = backoff(attempt);
+                        if !fits_in(delay, deadline_at) {
+                            return Err(previous.map_or_else(
+                                || self.deadline_error(),
+                                |r| r.into_error(removes && maybe_applied),
+                            ));
+                        }
                         log_debug!(
                             "{method} {path}: body dropped — retrying in {}ms (attempt {}/{attempts})",
                             delay.as_millis(),
                             attempt + 1
                         );
-                        tokio::time::sleep(sleep_within(delay, deadline_at, self.deadline)?).await;
+                        maybe_applied = true;
+                        tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;
                     }
@@ -2647,18 +3026,9 @@ truncated answer, not the whole store."
                 start.elapsed().as_millis(),
                 attempt + 1
             );
-            if !status.is_success() {
-                let (message, request_id) = parse_error(&text);
-                let message = match request_id {
-                    Some(id) => format!("{message} (request_id: {id})"),
-                    None => message,
-                };
-                return Err(WosError::Api { status: status.as_u16(), message });
-            }
             // An empty body is only legal when the STATUS says there is no body, where
             // it reads as `{}`. An empty body on any other 2xx means a response went
-            // missing on the way, and passing that off as success hides it. All three
-            // SDKs apply this rule.
+            // missing on the way, and passing that off as success hides it.
             if text.trim().is_empty() {
                 if NO_BODY_STATUS.contains(&status.as_u16()) {
                     return Ok(serde_json::json!({}));
@@ -2674,9 +3044,8 @@ truncated answer, not the whole store."
                 status: status.as_u16(),
                 message: format!("invalid JSON in response: {e}"),
             })?;
-            // Enforce a JSON OBJECT (parity with the Python/TS SDKs): every WOS
-            // endpoint returns one, so a body that parses to null / a number /
-            // an array is a broken server, not an empty result to swallow.
+            // Every endpoint returns a JSON OBJECT, so a body that parses to null / a
+            // number / an array is a broken server, not an empty result to swallow.
             if !v.is_object() {
                 return Err(WosError::Api {
                     status: status.as_u16(),
@@ -2684,10 +3053,8 @@ truncated answer, not the whole store."
                 });
             }
             let mut v = v;
-            // Only when the body does not already carry it. These responses are
-            // widening — a response may carry fields this client has never seen —
-            // and a client that writes into the service's object is one
-            // release away from overwriting a real answer with its own guess.
+            // Only when the body does not already carry it: the service's own value
+            // is the true one.
             if replayed {
                 if let Some(o) = v.as_object_mut() {
                     o.entry("replayed").or_insert(serde_json::Value::Bool(true));
@@ -2703,10 +3070,8 @@ truncated answer, not the whole store."
 mod store_resolution_tests {
     use super::*;
 
-    // These assert the DESTINATION of a call, which is the thing that silently changed
-    // between 2.2.27 (blank sent on, server mapped it to `default`) and 2.2.28 (blank
-    // trimmed, so the call was redirected to the client's bound store). Either way the
-    // caller never learned their tenant id was empty.
+    // These assert the DESTINATION of a call: a blank store id must never be sent on or
+    // quietly replaced by the client's bound store.
 
     #[test]
     fn a_passed_blank_store_id_is_rejected_rather_than_redirected() {
@@ -2746,8 +3111,8 @@ mod store_resolution_tests {
 
 #[cfg(test)]
 mod tests {
-    /// `Instant + Duration` panics on overflow, so a deadline past the clock's range
-    /// aborted the caller's task from inside the SDK on every call.
+    /// `Instant + Duration` panics on overflow; a deadline past the clock's range must
+    /// still resolve to a usable budget.
     #[test]
     fn a_deadline_past_the_clocks_range_does_not_panic() {
         for d in [
@@ -2767,16 +3132,15 @@ mod tests {
             .is_none());
     }
 
-    /// `retries + 1` wrapped to 0 in release, and `attempt + 1 < attempts` was then never
-    /// true — "retry as hard as you can" became "do not retry".
+    /// `retries + 1` must not wrap to 0: "retry as hard as you can" must not become
+    /// "do not retry".
     #[test]
     fn the_largest_retry_count_still_retries() {
         let c = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_retries(u32::MAX);
         assert_eq!(c.retries.saturating_add(1), u32::MAX, "attempts must not wrap to 0");
     }
 
-    /// with_user("") used to leave a blank default on the client, and every later call
-    /// resolved to it — the builder walking around the guard the per-call path applies.
+    /// with_user("") cannot leave a blank default that every later call resolves to.
     #[test]
     fn with_user_blank_cannot_silently_become_the_default_store() {
         let bound = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_user("tenant-a");
@@ -2790,7 +3154,7 @@ mod tests {
                 format!("{err}").contains("default store is blank"),
                 "with_user({blank:?}) must not resolve to a store: {err}"
             );
-            // The per-call form was already guarded; it must stay guarded.
+            // The per-call form stays guarded.
             assert!(c.uid(Some(blank)).is_err(), "uid(Some({blank:?}))");
         }
 
@@ -2838,7 +3202,7 @@ mod tests {
         (format!("http://{}", addr), seen)
     }
 
-    fn mock_server(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
+    pub(super) fn mock_server(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -2887,17 +3251,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
-    /// The count is refused out of range, not adjusted.
-    ///
-    /// `recall` has always been 5..=20 and the service refuses anything else.
-    /// Search had no contract: this crate sent whatever it was given, the MCP
-    /// server allowed 1..=60, and the service capped at 50 with no floor. Both
-    /// ends and every method, because a guard that lives in one of five call
-    /// sites is the shape of bug this crate has shipped before.
-    /// `get_image` goes through `request_bytes`, not `request_with_key`, so the key
-    /// checks that lived in the latter never ran for it — an empty or control-character
-    /// key reached the header and failed at the network as the 401 those checks exist
-    /// to replace. The README claimed the guard without naming a route.
+    /// `get_image` has its own request path; the key checks run on it too.
     #[tokio::test(flavor = "current_thread")]
     async fn get_image_refuses_a_bad_key_before_the_network() {
         let (base, hits) = mock_server(vec![]);
@@ -2911,6 +3265,7 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
     }
 
+    /// The count is refused out of range, not adjusted: both ends, every search method.
     #[tokio::test(flavor = "current_thread")]
     async fn search_count_out_of_range_is_refused_not_adjusted() {
         let (base, hits) = mock_server(vec![]);
@@ -3022,7 +3377,7 @@ mod tests {
 
     /// Serve `n` connections that send headers promising a body, then drop mid-body,
     /// and answer every connection after that with `tail`. Returns the hit count.
-    fn dropping_server(drops: usize, tail: String) -> (String, Arc<AtomicUsize>) {
+    pub(super) fn dropping_server(drops: usize, tail: String) -> (String, Arc<AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -3075,7 +3430,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_write_is_never_retried_when_the_body_drops_mid_stream() {
         // The other half, and the reason the rule is not simply "retry everything":
-        // headers came back, so the write may already have landed.
+        // headers came back, so the write may already have been applied.
         let (base, hits) = dropping_server(1, http("200 OK", "", r#"{"id":"m1","status":"stored"}"#));
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(2);
         let got = mem.add("hello", "alice", serde_json::json!({})).await;
@@ -3094,12 +3449,24 @@ mod tests {
 
     #[test]
     fn backoff_honors_retry_after_and_caps() {
-        assert_eq!(backoff(0, Some("2")).as_millis(), 2000);
-        assert_eq!(backoff(0, Some("999")).as_millis(), 30_000);
-        let b = backoff(3, None).as_millis();
+        assert_eq!(retry_wait(0, Some("2")).unwrap().as_millis(), 2000);
+        assert_eq!(retry_wait(0, Some("30")).unwrap().as_millis(), 30_000);
+        // Above the cap the client does not wait at all; the caller gets the 429.
+        assert_eq!(retry_wait(0, Some("999")), None);
+        let b = retry_wait(3, None).unwrap().as_millis();
         assert!((4000..=4250).contains(&b), "got {b}");
-        let cap = backoff(10, None).as_millis();
+        let cap = retry_wait(10, None).unwrap().as_millis();
         assert!((8000..=8250).contains(&cap), "got {cap}");
+    }
+
+    #[test]
+    fn only_delta_seconds_or_an_http_date_count_as_retry_after() {
+        for junk in ["-5", "5, 10", "0x2", "garbage", "", " ", "1.5", "+5", "inf", "NaN", "1e3", "٣"] {
+            let d = retry_wait(0, Some(junk)).expect("junk falls back to the backoff").as_millis();
+            assert!((500..750).contains(&d), "{junk:?} waited {d}ms instead of the backoff");
+        }
+        assert_eq!(retry_wait(0, Some("0")).unwrap().as_millis(), 0);
+        assert_eq!(retry_wait(0, Some("99999999999999999999999")), None, "huge is still above the cap");
     }
 
     // ----- security round 2 -----
@@ -3160,15 +3527,16 @@ mod tests {
 
     #[test]
     fn backoff_honors_retry_after_seconds_and_http_date() {
-        // delta-seconds form, capped at 30s.
-        assert_eq!(backoff(0, Some("2")).as_millis(), 2000);
-        assert_eq!(backoff(0, Some("999")).as_millis(), 30_000);
+        assert_eq!(retry_wait(0, Some("2")).unwrap().as_millis(), 2000);
         // HTTP-date in the past → retry immediately (0), not exponential backoff.
-        assert_eq!(backoff(3, Some("Wed, 21 Oct 2015 07:28:00 GMT")).as_millis(), 0);
-        // A future HTTP-date → a positive, capped wait.
+        assert_eq!(retry_wait(3, Some("Wed, 21 Oct 2015 07:28:00 GMT")).unwrap().as_millis(), 0);
+        // A future HTTP-date → a positive wait inside the cap.
         let future = httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(5));
-        let d = backoff(0, Some(&future)).as_millis();
-        assert!(d > 0 && d <= 30_000, "got {d}");
+        let d = retry_wait(0, Some(&future)).unwrap().as_millis();
+        assert!(d > 0 && d <= 5_000, "got {d}");
+        // An hour ahead is above the cap.
+        let later = httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+        assert_eq!(retry_wait(0, Some(&later)), None);
     }
 
 
@@ -3191,9 +3559,7 @@ mod tests {
         // A memory element with an explicit `null` on a non-Option scalar
         // (content / category / similarity / importance / is_superseded) must NOT
         // fail the whole search: the good elements survive and each null becomes
-        // the field's default. Before 2.2.17 this raised "invalid type: null,
-        // expected a string" and dropped EVERY memory in the batch. Parity with the
-        // Python (raw dict) and TS (structural cast) SDKs, which pass such rows through.
+        // the field's default.
         let body = "{\"memories\":[\
             {\"id\":\"1\",\"content\":\"good\",\"similarity\":0.9},\
             {\"id\":\"2\",\"content\":null,\"category\":null,\"similarity\":null,\"importance\":null,\"is_superseded\":null}\
@@ -3228,9 +3594,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn search_returns_both_fields() {
         // Some models answer with the assistant's own words in `self_memories`, not
-        // repeated in `memories`. Reading only `memories` meant an assistant
-        // turn stored with add_turn vanished from search on Scroll 1.2 while the same
-        // query returned it on others. Both fields come back, de-duplicated.
+        // repeated in `memories`. Both fields come back, de-duplicated.
         let (base, _) = mock_server(vec![http(
             "200 OK",
             "",
@@ -3271,8 +3635,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn search_coerces_null_or_nonarray_memories_to_empty() {
         // A server sending `memories: null` or a truthy non-array (`"oops"` / a number)
-        // must yield [], not an "invalid type" error — parity with py/ts. search_self's
-        // already coerced there; plain search / search_with lagged (errored on null).
+        // must yield [], not an "invalid type" error, on search and search_with alike.
         for body in ["{\"memories\":null}", "{\"memories\":\"oops\"}", "{\"memories\":42}", "{}"] {
             let (base, _) = mock_server(vec![http("200 OK", "", body), http("200 OK", "", body)]);
             let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
@@ -3322,7 +3685,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_write_not_retried_on_502() {
-        // A 502 on a write (POST) must NOT retry — the write may have landed.
+        // A 502 on a write (POST) must NOT retry — the write may already have been applied.
         let (base, hits) = mock_server(vec![http("502 Bad Gateway", "", "{\"error\":\"bad gateway\"}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         let r = mem.add("hi", "u", serde_json::json!({})).await;
@@ -3353,13 +3716,11 @@ mod tests {
         }
     }
 
-    // ----- 2.2.14 -----
-
     #[tokio::test(flavor = "current_thread")]
     async fn whitespace_in_key_errors_before_sending() {
         // The key is trimmed at construction; REMAINING (inner) whitespace is a
         // paste error that would read back as a mystery 401 — fail it clearly,
-        // before any request (parity with the Python/TS SDKs).
+        // before any request.
         let mem = Client::with_base_url("wos-test xxxxxxxxxx", "http://127.0.0.1:9");
         match mem.stats("alice").await {
             Err(WosError::Api { status, message }) => {
@@ -3420,16 +3781,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn list_all_memories_stops_on_repeated_cursor() {
-        // A server that repeats a cursor must not loop forever (only 2 requests).
+    async fn list_all_memories_refuses_a_repeated_cursor() {
+        // A cursor that comes back after a page with rows in it means the walk cannot
+        // finish: stop after two requests and say the answer is truncated.
         let (base, hits) = mock_server(vec![
             http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":\"C\"}"),
             http("200 OK", "", "{\"memories\":[{\"id\":\"2\"}],\"next_cursor\":\"C\"}"),
         ]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        match mem.list_all_memories("u").await {
+            Err(WosError::Api { status: 200, message }) => {
+                assert!(message.contains("truncated"), "got {message}");
+                assert!(!message.contains('\u{2014}'), "got {message}");
+            }
+            other => panic!("a repeated cursor must not read as a complete store, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_all_memories_refuses_a_cursor_cycle() {
+        let (base, hits) = mock_server(vec![
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":\"A\"}"),
+            http("200 OK", "", "{\"memories\":[{\"id\":\"2\"}],\"next_cursor\":\"B\"}"),
+            http("200 OK", "", "{\"memories\":[{\"id\":\"3\"}],\"next_cursor\":\"A\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.list_all_memories("u").await.unwrap_err();
+        assert!(format!("{e}").contains("truncated"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_all_memories_ends_on_an_empty_page_that_repeats_its_cursor() {
+        // An empty page has nothing left to lose, so a repeated cursor there is the end.
+        let (base, hits) = mock_server(vec![
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":\"C\"}"),
+            http("200 OK", "", "{\"memories\":[],\"next_cursor\":\"C\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         let all = mem.list_all_memories("u").await.unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(hits.load(Ordering::SeqCst), 2); // stopped after the cursor repeated
+        assert_eq!(all.len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     /// The image cursor is not `before` alone, it is **the pair `before` and `skip_ids`**.
@@ -3455,15 +3848,20 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 4);
     }
 
-    /// Standing still still has to stop: never hang forever on a server that keeps
-    /// returning the same pair.
+    /// A server that keeps returning the same pair must not hang the walk, and must not
+    /// pass for the end of the store either.
     #[tokio::test(flavor = "current_thread")]
-    async fn all_images_stops_when_the_cursor_pair_repeats() {
+    async fn all_images_refuses_a_repeated_cursor_pair() {
         let page = "{\"images\":[{\"id\":\"x\"}],\"has_more\":true,\"next_before\":\"T\",\"next_skip_ids\":[\"x\"]}";
         let (base, hits) = mock_server(vec![http("200 OK", "", page), http("200 OK", "", page)]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
-        let all = mem.list_all_images("u", None).await.unwrap();
-        assert_eq!(all.len(), 2);
+        match mem.list_all_images("u", None).await {
+            Err(WosError::Api { status: 200, message }) => {
+                assert!(message.contains("truncated"), "got {message}");
+                assert!(!message.contains('\u{2014}'), "got {message}");
+            }
+            other => panic!("a repeated cursor pair must not read as every image, got {other:?}"),
+        }
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
@@ -3515,10 +3913,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn revisions_goes_to_the_won_surface() {
-        // Won is a separate address, not a rename: calls a model makes ABOUT its memory
-        // live under /api/v1/won/*. The old /memory path still answers, so drifting back
-        // fails nothing at runtime — it only makes the docs teach an address no client
-        // calls. Pin it here so the three languages cannot disagree about it either.
+        // Calls a model makes ABOUT its memory live under /api/v1/won/*.
         let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{\"revised\":3,\"total\":40}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         mem.revisions("alice").await.unwrap();
@@ -3529,9 +3924,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn search_full_keeps_what_search_merges_away() {
-        // `search` answers with one merged Vec, so the photos and the count of re-ask
-        // passes actually run had nowhere to land. Both are billable, and both were
-        // being discarded.
+        // `search` answers with one merged Vec; search_full keeps the photos and the
+        // count of re-ask passes actually run.
         let payload = "{\"memories\":[{\"id\":\"m1\"}],\"self_memories\":[{\"id\":\"s1\"}],\
                        \"images\":[{\"id\":\"i1\"}],\"verify_used\":2}";
         let (base, seen) = mock_server_recording(vec![http("200 OK", "", payload)]);
@@ -3625,8 +4019,8 @@ mod tests {
         assert!(reqs[0].contains("\"include\":\"unrevised\""), "got {}", reqs[0]);
         assert!(reqs[0].contains("\"limit\":20"), "got {}", reqs[0]);
         assert!(reqs[0].contains("\"before\":\"2026-08-20T01:00:00Z\""), "got {}", reqs[0]);
-        // If the cursor loses its name the engine reads "no cursor", and the caller gets
-        // **page one forever**, without a single error.
+        // If the cursor loses its name the service reads "no cursor", and the caller
+        // gets **page one forever**, without a single error.
         assert!(reqs[0].contains("\"skip_ids\""), "cursor did not go out as snake_case: {}", reqs[0]);
     }
 
@@ -3645,10 +4039,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_with_carries_an_image_and_strips_what_breaks_it() {
-        // The three SDKs have to accept the SAME base64 on the same call. `base64` and
-        // `openssl base64` wrap at 76 columns, and Python/TypeScript have stripped those
-        // newlines since 2.2.31 while this client passed them straight through — so the
-        // identical file worked in two languages and 400'd in the third.
+        // `base64` and `openssl base64` wrap at 76 columns; those newlines, and a
+        // data: prefix, are stripped before sending.
         let flat = "AAAABBBBCCCCDDDD".repeat(12); // 192 chars, longer than one wrap
         let wrapped: String = flat
             .as_bytes()
@@ -3661,7 +4053,7 @@ mod tests {
         let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{\"id\":\"m1\"}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         mem.add_with(
-            "",
+            "a striped test card",
             "alice",
             serde_json::json!({}),
             serde_json::json!({"image": {
@@ -3706,11 +4098,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn add_with_refuses_an_image_that_is_only_a_prefix() {
-        // A data: URL with nothing after the comma is an empty image, and the engine
+        // A data: URL with nothing after the comma is an empty image, and the service
         // answers "not a readable image" — a message that points at the file. Say it here.
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:1");
         match mem
-            .add_with("", "alice", serde_json::json!({}), serde_json::json!({"image": {"data": "data:image/png;base64,"}}))
+            .add_with("a caption", "alice", serde_json::json!({}), serde_json::json!({"image": {"data": "data:image/png;base64,"}}))
             .await
         {
             Err(WosError::Api { status: 400, message }) => {
@@ -3719,7 +4111,7 @@ mod tests {
             other => panic!("expected a 400 about an empty image, got {other:?}"),
         }
         match mem
-            .add_with("", "alice", serde_json::json!({}), serde_json::json!({"image": {"reference": "s3://x"}}))
+            .add_with("a caption", "alice", serde_json::json!({}), serde_json::json!({"image": {"reference": "s3://x"}}))
             .await
         {
             Err(WosError::Api { status: 400, message }) => {
@@ -3731,49 +4123,47 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_deadline_bounds_the_whole_call_not_one_attempt() {
-        // `with_timeout` bounded one attempt, so nothing bounded the call: at the
-        // defaults a single call can hold for 30s + backoff + 30s + backoff + 30s and
-        // a handler awaiting it had no way to say how long it actually had. The
-        // 5-second Retry-After below is the backoff this budget must cut short.
-        let (base, _) = mock_server(vec![
-            http("429 Too Many Requests", "Retry-After: 5\r\n", "{\"error\":\"rate limited\"}"),
+        // A deadline bounds the call across every attempt. The 5-second Retry-After
+        // below does not fit in it, so the call stops at once and reports the 429 it
+        // got rather than a budget error.
+        let (base, hits) = mock_server(vec![
+            http(
+                "429 Too Many Requests",
+                "Retry-After: 5\r\n",
+                "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"rate limited\",\"request_id\":\"req_rl\"}}",
+            ),
             http("200 OK", "", "{\"memories\":[]}"),
         ]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
             .with_deadline(std::time::Duration::from_millis(200));
         let t0 = std::time::Instant::now();
-        match mem.search("q", "alice", 10).await {
-            Err(WosError::Api { status: 0, message }) => {
-                assert!(message.contains("exhausted"), "got {message}")
-            }
-            other => panic!("expected an exhausted budget, got {other:?}"),
-        }
-        // Under the budget, not merely under some larger number: the bound here was
-        // 1.5s, which a run that slept out the remainder and then gave up passed just
-        // as well as one that refused at once.
+        let e = mem.search("q", "alice", 10).await.unwrap_err();
+        assert_eq!(e.status(), Some(429), "got {e}");
+        assert!(e.is_rate_limited(), "got {e}");
+        assert!(format!("{e}").contains("req_rl"), "the request id must survive: {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(t0.elapsed().as_secs_f64() < 0.15, "spent {:?} on a 200ms budget", t0.elapsed());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_clone_keeps_the_deadline() {
-        // The same trap the transport fell into: a clone that quietly drops it works
-        // right up to the call that needed the budget.
+        // A clone that dropped the deadline would sleep out the 5s Retry-After.
         let (base, _) = mock_server(vec![http(
             "429 Too Many Requests", "Retry-After: 5\r\n", "{}",
         )]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
             .with_deadline(std::time::Duration::from_millis(200))
             .with_model("tablet-2");
+        let t0 = std::time::Instant::now();
         assert!(mem.search("q", "alice", 10).await.is_err());
+        assert!(t0.elapsed().as_secs_f64() < 1.0, "the clone slept for {:?}", t0.elapsed());
     }
 
     // ── recall's promise, kept ────────────────────────────────────────────
     #[tokio::test(flavor = "current_thread")]
     async fn recall_refuses_a_count_out_of_range_without_sending() {
-        // `RecallOpts` said "out of range is refused, not clamped" and nothing
-        // enforced it. `limit: 500` reached the engine and died there — a service
-        // error for a mistake visible before opening a socket. The mock is handed a
-        // response it must never get to serve.
+        // "Out of range is refused, not clamped", before a socket is opened. The mock
+        // is handed a response it must never get to serve.
         let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         for bad in [0usize, 1, 4, 21, 500] {
@@ -3835,8 +4225,6 @@ mod tests {
             other => panic!("expected an empty-body error, got {other:?}"),
         }
     }
-    // ── 2.2.25 ─────────────────────────────────────────────────────────────
-
     #[tokio::test(flavor = "current_thread")]
     async fn add_refuses_a_store_name_as_metadata_before_the_network() {
         let off = Client::with_base_url("wos-test-xxxxxxxxxx", "http://127.0.0.1:9");
@@ -3901,12 +4289,20 @@ mod tests {
 mod store_id_warning_bound_tests {
     use super::*;
 
-    /// The warning record is process-global and tests run in parallel. These three
-    /// read that state directly, so serialize them; without this, entries written by
-    /// another test bleed in and the result changes from run to run.
+    /// The warning record is process-global and tests run in parallel. The tests that
+    /// take this lock read that state directly; without it, entries written by another
+    /// test bleed in and the result changes from run to run.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Clears only the store-id set: the filter and metadata sets belong to tests
+    /// running at the same time.
+    fn reset_store_ids() {
+        if let Some(m) = WARNED_STORE_IDS.get() {
+            m.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
     }
 
     /// This warning fires on ids whose normalized form differs or that the API refuses,
@@ -3915,7 +4311,7 @@ mod store_id_warning_bound_tests {
     #[test]
     fn warned_ids_stay_bounded() {
         let _g = serial();
-        _reset_warning_state();
+        reset_store_ids();
         for i in 0..(WARNED_STORE_IDS_MAX * 3) {
             warn_if_store_id_collapses(&format!("user.{i}@example.com"));
         }
@@ -3931,7 +4327,7 @@ mod store_id_warning_bound_tests {
     #[test]
     fn a_late_first_collision_is_still_recorded() {
         let _g = serial();
-        _reset_warning_state();
+        reset_store_ids();
         for i in 0..(WARNED_STORE_IDS_MAX * 2) {
             warn_if_store_id_collapses(&format!("user.{i}@example.com"));
         }
@@ -3952,7 +4348,9 @@ mod store_id_warning_bound_tests {
         assert!(ids.iter().all(|id| g.iter().any(|s| s == id)));
     }
 
-    /// An id that does not fold is never recorded, so it cannot waste the cap.
+    /// An id that does not fold is never recorded, so it cannot waste the cap. Other
+    /// tests write folding ids into the same set at the same time, so this looks only
+    /// for its own ids.
     #[test]
     fn clean_ids_are_not_recorded() {
         let _g = serial();
@@ -3972,33 +4370,49 @@ mod store_id_warning_bound_tests {
 
 #[cfg(test)]
 mod plain_http_host_tests {
-    // `http://127.0.0.1:9@evil.example` reads as loopback to a naive check: the authority
-    // was split on ':' before the userinfo was removed, so the check saw "127.0.0.1" and
-    // stayed silent while the API key travelled in cleartext to evil.example. The host is
-    // whatever follows the last '@'.
-    fn host_of(base_url: &str) -> String {
-        let lower = base_url.to_ascii_lowercase();
-        let Some(rest) = lower.strip_prefix("http://") else { return String::new() };
-        let authority = rest.split('/').next().unwrap_or("");
-        let hostport = authority.rsplit('@').next().unwrap_or("");
-        if let Some(v6) = hostport.strip_prefix('[') {
-            v6.split(']').next().unwrap_or("").to_string()
-        } else {
-            hostport.split(':').next().unwrap_or("").to_string()
+    //! The warning reads the URL the way the transport does, so a spelling that
+    //! connects to a remote host in cleartext cannot pass for loopback.
+    use super::plain_http_to_remote;
+
+    #[test]
+    fn userinfo_cannot_impersonate_loopback() {
+        for base in [
+            "http://127.0.0.1:9@evil.example/x",
+            "http://localhost@evil.example",
+            "http://evil.example\\@127.0.0.1",
+            "http://evil.example?@127.0.0.1",
+            "http://evil.example#@127.0.0.1",
+        ] {
+            assert!(plain_http_to_remote(base), "{base} must warn");
         }
     }
 
     #[test]
-    fn userinfo_cannot_impersonate_loopback() {
-        assert_eq!(host_of("http://127.0.0.1:9@evil.example/x"), "evil.example");
-        assert_eq!(host_of("http://localhost@evil.example"), "evil.example");
+    fn spellings_the_transport_accepts_still_warn() {
+        for base in [
+            "http://evil.example",
+            "HTTP://evil.example",
+            " http://evil.example",
+            "http:/example.net:8080",
+            "http://example.net:8080",
+        ] {
+            assert!(plain_http_to_remote(base), "{base:?} must warn");
+        }
     }
 
     #[test]
-    fn real_loopback_still_reads_as_loopback() {
-        assert_eq!(host_of("http://127.0.0.1:8080/x"), "127.0.0.1");
-        assert_eq!(host_of("http://localhost:3000"), "localhost");
-        assert_eq!(host_of("http://[::1]:8080"), "::1");
+    fn real_loopback_and_https_stay_quiet() {
+        for base in [
+            "http://127.0.0.1:8080/x",
+            "http://localhost:3000",
+            "http://LOCALHOST",
+            "http://[::1]:8080",
+            "http://0.0.0.0:1",
+            "https://evil.example",
+            "not a url",
+        ] {
+            assert!(!plain_http_to_remote(base), "{base} must not warn");
+        }
     }
 }
 
@@ -4009,7 +4423,7 @@ mod retry_status_tests {
     #[test]
     fn a_write_is_never_retried_on_an_ambiguous_status() {
         // The whole reason the set is split: the error can arrive after the write
-        // already landed, so a retried POST would write twice.
+        // was applied, so a retried POST could apply it twice.
         for s in [408, 502, 503, 504] {
             assert!(!status_is_retryable(s, false), "{s} retried a write");
         }
@@ -4207,5 +4621,1193 @@ mod widening_tests {
         let v = serde_json::json!({"short_term": {}, "long_term": {}, "context": {}});
         let got: RecallResponse = serde_json::from_value(v).unwrap();
         assert!(got.extra.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod conflict_retry_tests {
+    //! 409 means one of two things: another write to the store was in flight
+    //! (`retry_after_ms`, nothing stored), or the store id collides with an existing
+    //! one (`conflicts_with`, permanent).
+    use super::tests::{http, mock_server};
+    use super::{Client, ErrorKind};
+    use std::sync::atomic::Ordering;
+
+    const WRITE_LOCK: &str = "{\"type\":\"error\",\"error\":{\"type\":\"conflict_error\",\
+        \"message\":\"Another write to store 'alice' is already in flight. Nothing was stored or changed.\",\
+        \"request_id\":\"req_lock\",\"retry_after_ms\":100}}";
+    const COLLISION: &str = "{\"type\":\"error\",\"error\":{\"type\":\"conflict_error\",\
+        \"message\":\"Store id 'team.a' collides with existing store 'team-a'.\",\
+        \"request_id\":\"req_col\",\"conflicts_with\":\"team-a\"}}";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_lock_409_is_retried_even_on_a_write() {
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", WRITE_LOCK),
+            http("200 OK", "", "{\"id\":\"m1\",\"status\":\"stored\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let v = mem.add("x", "alice", serde_json::json!({})).await.expect("retried after the lock");
+        assert_eq!(v["id"], "m1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_lock_409_waits_at_least_what_it_asked_for() {
+        let lock = WRITE_LOCK.replace("\"retry_after_ms\":100", "\"retry_after_ms\":900");
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", &lock),
+            http("200 OK", "", "{\"id\":\"m1\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let t0 = std::time::Instant::now();
+        mem.add("x", "alice", serde_json::json!({})).await.unwrap();
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(900), "waited only {:?}", t0.elapsed());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_lock_409_stays_inside_the_retry_count() {
+        // Default retries (2): three attempts, then the 409. The 200 is never served.
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", WRITE_LOCK),
+            http("409 Conflict", "", WRITE_LOCK),
+            http("409 Conflict", "", WRITE_LOCK),
+            http("200 OK", "", "{\"id\":\"m1\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(e.status(), Some(409), "got {e}");
+        assert_eq!(e.kind(), ErrorKind::Conflict);
+        assert!(format!("{e}").contains("req_lock"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", WRITE_LOCK),
+            http("200 OK", "", "{\"id\":\"m1\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(0);
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Conflict);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_store_id_collision_is_never_retried() {
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", COLLISION),
+            http("200 OK", "", "{\"user_id\":\"team.a\",\"status\":\"created\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.create_store("team.a").await.unwrap_err();
+        assert_eq!(e.status(), Some(409));
+        assert_eq!(e.kind(), ErrorKind::Conflict);
+        assert!(format!("{e}").contains("collides"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_409_with_both_fields_or_neither_is_not_retried() {
+        let both = COLLISION.replace("\"conflicts_with\"", "\"retry_after_ms\":100,\"conflicts_with\"");
+        let neither = "{\"error\":{\"type\":\"conflict_error\",\"message\":\"conflict\"}}";
+        let plain = "{\"error\":\"conflict\"}";
+        for body in [both.as_str(), neither, plain] {
+            let (base, hits) = mock_server(vec![
+                http("409 Conflict", "", body),
+                http("200 OK", "", "{\"id\":\"m1\"}"),
+            ]);
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+            let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+            assert_eq!(e.status(), Some(409), "{body}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "{body} was retried");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_retries_a_write_lock_409_too() {
+        let (base, hits) = mock_server(vec![
+            http("409 Conflict", "", WRITE_LOCK),
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPNG!".to_string(),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let (bytes, ctype) = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap();
+        assert_eq!(bytes, b"PNG!");
+        assert_eq!(ctype, "image/png");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod retry_wait_tests {
+    //! What a retry may wait, and what the caller sees when it cannot.
+    use super::tests::{http, mock_server};
+    use super::{Client, ErrorKind};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_whose_backoff_cannot_fit_reports_the_503() {
+        let (base, hits) = mock_server(vec![
+            http(
+                "503 Service Unavailable",
+                "Retry-After: 5\r\n",
+                "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\",\"request_id\":\"req_503\"}}",
+            ),
+            http("200 OK", "", "{\"collections\":[]}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        let e = mem.list_stores().await.unwrap_err();
+        assert_eq!(e.status(), Some(503), "got {e}");
+        assert_eq!(e.kind(), ErrorKind::Server);
+        assert!(format!("{e}").contains("req_503"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(t0.elapsed().as_secs_f64() < 0.15, "spent {:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_after_beyond_the_cap_is_not_slept_through() {
+        let an_hour = httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+        for ra in ["3600".to_string(), an_hour] {
+            let (base, hits) = mock_server(vec![
+                http(
+                    "429 Too Many Requests",
+                    &format!("Retry-After: {ra}\r\n"),
+                    "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"free endpoint limit\",\"request_id\":\"req_cap\"}}",
+                ),
+                http("200 OK", "", "{\"days\":7}"),
+            ]);
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+            let t0 = std::time::Instant::now();
+            let e = mem.usage(7).await.unwrap_err();
+            assert!(e.is_rate_limited(), "Retry-After {ra}: got {e}");
+            assert!(format!("{e}").contains("req_cap"), "got {e}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "Retry-After {ra} was retried");
+            assert!(t0.elapsed().as_secs_f64() < 1.0, "slept {:?} for Retry-After {ra}", t0.elapsed());
+        }
+    }
+
+    const LIMITED: &str = "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\
+        \"message\":\"slow down\",\"request_id\":\"req_429\"}}";
+
+    /// Answer the first connection with a 429 asking for 1s, then take the second
+    /// and answer it only after `hold`.
+    fn limited_then_stalls(hold: std::time::Duration) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            for i in 0..2 {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 2048];
+                while let Ok(n) = sock.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                h.fetch_add(1, Ordering::SeqCst);
+                if i == 0 {
+                    let _ = sock.write_all(http("429 Too Many Requests", "Retry-After: 1\r\n", LIMITED).as_bytes());
+                } else {
+                    std::thread::sleep(hold);
+                    let _ = sock.write_all(http("200 OK", "", "{\"collections\":[]}").as_bytes());
+                }
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_whose_last_attempt_runs_out_of_budget_reports_the_429() {
+        let (base, hits) = limited_then_stalls(std::time::Duration::from_secs(2));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(1200));
+        let t0 = std::time::Instant::now();
+        let e = mem.list_stores().await.unwrap_err();
+        assert_eq!(e.status(), Some(429), "got {e:?}");
+        assert!(e.is_rate_limited());
+        assert!(format!("{e}").contains("req_429"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(t0.elapsed().as_secs_f64() < 1.6, "spent {:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_that_drops_with_no_time_to_back_off_reports_the_answer_before_it() {
+        let (base, hits) = mock_server(vec![
+            http("429 Too Many Requests", "Retry-After: 0\r\n", r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#),
+            String::new(),
+        ]);
+        // The next backoff, about 1s, does not fit what is left of 600ms.
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(600));
+        let e = mem.list_stores().await.unwrap_err();
+        assert_eq!(e.status(), Some(429), "got {e:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_whose_last_attempt_runs_out_of_budget_reports_the_429() {
+        let (base, hits) = limited_then_stalls(std::time::Duration::from_secs(2));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(1200));
+        let e = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
+        assert_eq!(e.status(), Some(429), "got {e:?}");
+        assert!(format!("{e}").contains("req_429"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_that_times_out_at_the_deadline_reports_the_deadline() {
+        // The second attempt went out and may have been applied, so the 429 before it
+        // (nothing written) is not what the caller sees.
+        let (base, hits) = limited_then_stalls(std::time::Duration::from_secs(2));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(1200));
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connection, "got {e:?}");
+        assert_eq!(e.status(), Some(0), "got {e:?}");
+        assert!(format!("{e}").contains("deadline of 1.2s exhausted"), "got {e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Take one connection and answer it only after `hold`. With `head_first` the
+    /// headers go out at once and the body is what is held.
+    fn stalls(hold: std::time::Duration, head_first: bool, body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while let Ok(n) = sock.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if head_first {
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.flush();
+            }
+            std::thread::sleep(hold);
+            if !head_first {
+                let _ = sock.write_all(head.as_bytes());
+            }
+            let _ = sock.write_all(body);
+        });
+        format!("http://{addr}")
+    }
+
+    fn assert_deadline(e: &super::WosError, what: &str) {
+        assert_eq!(e.status(), Some(0), "{what}: got {e:?}");
+        assert_eq!(e.kind(), ErrorKind::Connection, "{what}: got {e:?}");
+        assert!(format!("{e}").contains("deadline of 300ms exhausted"), "{what}: got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_first_attempt_cut_short_by_the_deadline_reports_the_deadline() {
+        const OK: &[u8] = b"{\"collections\":[],\"id\":\"m1\"}";
+        let hold = std::time::Duration::from_secs(2);
+        let deadline = std::time::Duration::from_millis(300);
+        for head_first in [false, true] {
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &stalls(hold, head_first, OK)).with_deadline(deadline);
+            let e = mem.list_stores().await.unwrap_err();
+            assert_deadline(&e, &format!("read, head_first={head_first}"));
+
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &stalls(hold, head_first, OK)).with_deadline(deadline);
+            let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+            assert_deadline(&e, &format!("write, head_first={head_first}"));
+
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &stalls(hold, head_first, b"PNG!")).with_deadline(deadline);
+            let e = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
+            assert_deadline(&e, &format!("get_image, head_first={head_first}"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_attempt_timeout_without_a_deadline_still_says_timed_out() {
+        let mem = Client::with_base_url(
+            "wos-test-xxxxxxxxxx",
+            &stalls(std::time::Duration::from_secs(3), false, b"{}"),
+        )
+        .with_timeout(1)
+        .with_retries(0);
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(e.status(), None, "got {e:?}");
+        assert!(format!("{e}").contains("timed out"), "got {e}");
+    }
+
+    /// Two clients that hit the same conflict at the same moment must not retry in step.
+    #[test]
+    fn backoff_jitter_spreads_retries() {
+        let jitters: std::collections::HashSet<u128> =
+            (0..64).map(|_| super::backoff(0).as_millis() - 500).collect();
+        assert!(jitters.iter().all(|j| *j < 250), "jitter out of range: {jitters:?}");
+        assert!(jitters.len() > 8, "jitter barely varies: {jitters:?}");
+        for attempt in 1..8 {
+            let d = super::backoff(attempt).as_millis();
+            let base = (500u128 << attempt.min(4)).min(8_000);
+            assert!((base..base + 250).contains(&d), "attempt {attempt}: {d}ms");
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_surface_tests {
+    //! What an error shows, and what it keeps.
+    use super::tests::{http, mock_server};
+    use super::{Client, ErrorKind, WosError};
+    use std::sync::atomic::Ordering;
+
+    fn closed_port() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        format!("http://{a}")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_network_error_never_carries_the_url_or_its_query() {
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &closed_port()).with_retries(0);
+        let e = mem.list_speakers("alice.customer@example.com").await.unwrap_err();
+        assert!(matches!(e, WosError::Network(_)), "got {e:?}");
+        for shown in [format!("{e}"), format!("{e:?}")] {
+            assert!(!shown.contains("alice"), "the store id leaked: {shown}");
+            assert!(!shown.contains("user_id="), "the query leaked: {shown}");
+            assert!(!shown.contains("/api/v1"), "the path leaked: {shown}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_network_error_names_its_cause_and_keeps_its_source() {
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &closed_port()).with_retries(0);
+        let e = mem.list_stores().await.unwrap_err();
+        assert!(format!("{e}").contains("connection refused"), "got {e}");
+        assert!(std::error::Error::source(&e).is_some(), "the transport error must be reachable");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_invalid_base_url_is_a_bad_request_and_is_not_retried() {
+        for bad in ["not a url", "ftp://example.com", "http://", "https://"] {
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", bad);
+            let t0 = std::time::Instant::now();
+            let e = mem.list_stores().await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::BadRequest, "{bad}: got {e:?}");
+            assert!(format!("{e}").contains("invalid base_url"), "{bad}: got {e}");
+            assert!(t0.elapsed().as_secs_f64() < 0.3, "{bad}: retried for {:?}", t0.elapsed());
+            let e = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::BadRequest, "{bad} get_image: got {e:?}");
+            assert!(t0.elapsed().as_secs_f64() < 0.3, "{bad}: get_image retried for {:?}", t0.elapsed());
+        }
+    }
+
+    #[test]
+    fn a_refused_body_is_a_bad_request() {
+        for status in [400u16, 413, 422] {
+            let e = WosError::Api { status, message: "x".into() };
+            assert_eq!(e.kind(), ErrorKind::BadRequest, "{status}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_413_from_the_service_is_a_bad_request() {
+        let (base, _) = mock_server(vec![http(
+            "413 Payload Too Large",
+            "",
+            "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Request body too large (max 10MB)\"}}",
+        )]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::BadRequest);
+        assert!(format!("{e}").contains("10MB"), "got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_object_valued_message_falls_back_to_the_type() {
+        let (base, _) = mock_server(vec![http(
+            "404 Not Found",
+            "",
+            "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":{\"text\":\"x\"},\"request_id\":\"r-9\"}}",
+        )]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.stats("alice").await.unwrap_err();
+        let shown = format!("{e}");
+        assert!(shown.contains("not_found_error") && shown.contains("r-9"), "got {shown}");
+        assert!(!shown.contains("{\"text\""), "got {shown}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_errors_carry_the_request_id() {
+        let (base, _) = mock_server(vec![http(
+            "404 Not Found",
+            "",
+            "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"Not found.\",\"request_id\":\"req_img\"}}",
+        )]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert!(format!("{e}").contains("req_img"), "got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn control_characters_from_the_server_never_reach_the_message() {
+        let hostile = "{\"error\":{\"message\":\"boom\\u001b[31mRED\\r\\nInjected: line\\u0000\\u007f\\t!\"}}";
+        let raw = "oops\u{1b}[2J\r\nfake log line";
+        let (base, _) = mock_server(vec![
+            http("500 Internal Server Error", "", hostile),
+            http("500 Internal Server Error", "", raw),
+            http("500 Internal Server Error", "", hostile),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let a = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        let b = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        let c = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
+        for e in [a, b, c] {
+            let shown = format!("{e}");
+            assert!(
+                !shown.chars().any(|ch| (ch as u32) < 0x20 || ch == '\u{7f}'),
+                "a control character survived: {shown:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_reports_why_it_could_not_read_an_error_body() {
+        let (base, _) = mock_server(vec![format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{}}",
+            70 * 1024 * 1024
+        )]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        match mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await {
+            Err(WosError::Api { status: 500, message }) => {
+                assert!(message.contains("too large"), "got {message:?}")
+            }
+            other => panic!("expected a 500 that says why, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_hides_credentials_in_the_base_url() {
+        for base in [
+            "https://user:hunter2pass@proxy.example.com",
+            "https://hunter2pass@proxy.example.com/prefix",
+            "http://u:hunter2pass@[::1]:8080",
+            "http://u:hunter2pass@proxy.example.com:notaport",
+        ] {
+            let dbg = format!("{:?}", Client::with_base_url("wos-test-xxxxxxxxxx", base));
+            assert!(!dbg.contains("hunter2pass"), "{base} leaked into {dbg}");
+        }
+        let dbg = format!("{:?}", Client::with_base_url("wos-test-xxxxxxxxxx", "https://user:pw@proxy.example.com"));
+        assert!(dbg.contains("proxy.example.com"), "the host is still useful: {dbg}");
+    }
+
+    #[test]
+    fn debug_hides_credentials_the_url_parser_does_not_read_as_such() {
+        for (base, shown) in [
+            ("https://user:s3/cr3t@api.example.com", "https://***@api.example.com"),
+            ("https://user:s3cr3t#x@api.example.com", "https://***@api.example.com"),
+            ("https://user:s3?cr3t@api.example.com", "https://***@api.example.com"),
+            ("https://user:123/cr3t@api.example.com", "https://***@api.example.com"),
+            ("user:s3cr3t@api.example.com", "***@api.example.com"),
+            // Read as user "user", password "p", host "ss".
+            ("https://user:p@ss/cr3t@api.example.com", "https://***@api.example.com"),
+            ("user:cr3t://x@api.example.com", "***@api.example.com"),
+        ] {
+            let dbg = format!("{:?}", Client::with_base_url("wos-test-xxxxxxxxxx", base));
+            assert!(!dbg.contains("cr3t"), "{base} leaked into {dbg}");
+            assert!(dbg.contains(&format!("{shown:?}")), "{base}: got {dbg}");
+        }
+        // Nothing to hide: shown as written.
+        for base in ["https://api.example.com", "http://127.0.0.1:9/prefix", "not a url"] {
+            let dbg = format!("{:?}", Client::with_base_url("wos-test-xxxxxxxxxx", base));
+            assert!(dbg.contains(&format!("{base:?}")), "{base}: got {dbg}");
+        }
+    }
+
+    #[test]
+    fn a_base_url_with_no_host_is_refused_before_sending() {
+        for bad in ["http://", "https://", "http:", "https:///"] {
+            match Client::with_base_url("wos-test-xxxxxxxxxx", bad).preflight() {
+                Err(WosError::Api { status: 400, message }) => {
+                    assert!(message.contains("invalid base_url"), "{bad}: got {message}")
+                }
+                other => panic!("{bad} must be refused before sending, got {other:?}"),
+            }
+        }
+        for good in ["https://api.wontopos.com", "http://127.0.0.1:9", "https://proxy.example.com/wos/"] {
+            assert!(Client::with_base_url("wos-test-xxxxxxxxxx", good).preflight().is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn a_base_url_the_parser_would_reread_is_refused_and_its_ends_are_trimmed() {
+        for bad in ["https:/\\evil.example", "http://evil.example\\@127.0.0.1", "https://api.won\ttopos.com", "https://a.example/x y", "https://a.example/\u{0}"] {
+            match Client::with_base_url("wos-test-xxxxxxxxxx", bad).preflight() {
+                Err(WosError::Api { status: 400, message }) => assert!(message.contains("backslash"), "{bad:?}: got {message}"),
+                other => panic!("{bad:?} must be refused before sending, got {other:?}"),
+            }
+        }
+        for padded in ["https://api.wontopos.com\n", " https://api.wontopos.com/ ", "\thttps://api.wontopos.com\r\n"] {
+            let c = Client::with_base_url("wos-test-xxxxxxxxxx", padded);
+            assert!(c.preflight().is_ok(), "{padded:?}");
+            assert_eq!(c.base_url, "https://api.wontopos.com", "{padded:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_invalid_base_url_error_does_not_show_its_credentials() {
+        for bad in ["https://u:hunter2@host:99999", "u:hunter2@host", "https://u:hunter2@", "ftp://u:hunter2@host"] {
+            let e = Client::with_base_url("wos-test-xxxxxxxxxx", bad).list_stores().await.unwrap_err();
+            assert!(format!("{e}").contains("invalid base_url"), "{bad}: got {e}");
+            assert!(!format!("{e} {e:?}").contains("hunter2"), "{bad} leaked into {e:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_error_messages_use_plain_punctuation() {
+        let e = Client::with_base_url("wos-test-xxxxxxxxxx", "not a url").list_stores().await.unwrap_err();
+        assert!(format!("{e}").contains("invalid base_url"), "got {e}");
+        assert!(!format!("{e}").contains('\u{2014}'), "got {e}");
+        // The two errors both page walks return, in full.
+        assert_eq!(
+            format!("{}", super::page_ceiling()),
+            "[200] stopped after 20000 pages \u{2014} the store did not end. This is a truncated answer, not the whole store."
+        );
+        assert_eq!(
+            format!("{}", super::repeated_cursor()),
+            "[200] the service handed back a cursor it had already given, so the store did not end. \
+             This is a truncated answer, not the whole store."
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_checks_the_model_name_before_sending() {
+        let (base, hits) = mock_server(vec![]);
+        for bad in ["bad model", "", "bad\r\nX-Evil: 1"] {
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_model(bad);
+            match mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await {
+                Err(WosError::Api { status: 400, message }) => {
+                    assert!(message.contains("invalid model name"), "{bad:?}: got {message}")
+                }
+                other => panic!("{bad:?} should be refused locally, got {other:?}"),
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
+    }
+
+    #[test]
+    fn an_empty_message_falls_back_to_the_type_and_keeps_the_request_id() {
+        let (m, rid) = super::parse_error(
+            "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"\",\"request_id\":\"req_e\"}}",
+        );
+        assert_eq!(m, "invalid_request_error");
+        assert_eq!(rid.as_deref(), Some("req_e"));
+
+        // Neither a usable message nor a type: the raw body, still with its request id.
+        let raw = "{\"error\":{\"message\":{\"a\":1},\"request_id\":\"req_o\"}}";
+        let (m, rid) = super::parse_error(raw);
+        assert_eq!(m, raw);
+        assert_eq!(rid.as_deref(), Some("req_o"));
+
+        // A request id that is empty is no request id.
+        let (_, rid) = super::parse_error("{\"error\":{\"type\":\"t\",\"message\":\"m\",\"request_id\":\"\"}}");
+        assert_eq!(rid, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_error_with_nothing_to_say_names_its_status() {
+        let (base, _) = mock_server(vec![
+            http("502 Bad Gateway", "", ""),
+            http("400 Bad Request", "", "{\"error\":\"\"}"),
+            http("400 Bad Request", "", "{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"\",\"request_id\":\"req_e\"}}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(0);
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(format!("{e}"), "[502] HTTP 502");
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(format!("{e}"), "[400] HTTP 400");
+        let e = mem.add("x", "alice", serde_json::json!({})).await.unwrap_err();
+        assert_eq!(format!("{e}"), "[400] invalid_request_error (request_id: req_e)");
+    }
+}
+
+#[cfg(test)]
+mod page_size_tests {
+    //! Page sizes are checked before sending, with the range in the message.
+    use super::tests::{http, mock_server};
+    use super::{Client, SearchOpts, WosError};
+    use std::sync::atomic::Ordering;
+
+    fn refused(r: Result<(), WosError>, range: &str, what: &str) {
+        match r {
+            Err(WosError::Api { status: 400, message }) => {
+                assert!(message.contains(range), "{what}: got {message}")
+            }
+            other => panic!("{what} should be refused locally, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_speaker_and_revision_pages_are_5_to_20() {
+        let (base, hits) = mock_server(vec![]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        for bad in [0usize, 4, 21, 100, usize::MAX] {
+            refused(mem.list_images("alice", bad, None, None).await.map(|_| ()), "between 5 and 20", "list_images");
+            refused(mem.list_all_images("alice", bad).await.map(|_| ()), "between 5 and 20", "list_all_images");
+            refused(mem.export_images("alice", bad).await.map(|_| ()), "between 5 and 20", "export_images");
+            refused(mem.iter_images("alice", bad).await.map(|_| ()), "between 5 and 20", "iter_images");
+            refused(mem.by_speaker("Bob", "alice", bad, None, None).await.map(|_| ()), "between 5 and 20", "by_speaker");
+            refused(
+                mem.revisions_page("alice", "revised", bad, None, None).await.map(|_| ()),
+                "between 5 and 20",
+                "revisions_page",
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_ends_of_each_range_are_sent() {
+        let ok = || http("200 OK", "", "{\"images\":[],\"memories\":[],\"has_more\":false}");
+        let (base, hits) = mock_server((0..12).map(|_| ok()).collect());
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        for n in [5usize, 20] {
+            mem.list_images("alice", n, None, None).await.unwrap();
+            mem.list_all_images("alice", n).await.unwrap();
+            mem.by_speaker("Bob", "alice", n, None, None).await.unwrap();
+            mem.revisions_page("alice", "revised", n, None, None).await.unwrap();
+        }
+        mem.list_memories("alice", 1, None).await.unwrap();
+        mem.list_memories("alice", 500, None).await.unwrap();
+        mem.search_opts("q", "alice", 10, &SearchOpts { max_images: Some(0), ..Default::default() }).await.unwrap();
+        mem.search_opts("q", "alice", 10, &SearchOpts { max_images: Some(5), ..Default::default() }).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 12);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_images_is_0_to_5() {
+        let (base, hits) = mock_server(vec![]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        for bad in [6usize, 100] {
+            let opts = SearchOpts { max_images: Some(bad), ..Default::default() };
+            refused(mem.search_opts("q", "alice", 10, &opts).await.map(|_| ()), "between 0 and 5", "search_opts");
+            refused(mem.search_full("q", "alice", 10, &opts).await.map(|_| ()), "between 0 and 5", "search_full");
+        }
+        for bad in [serde_json::json!(true), serde_json::json!(6), serde_json::json!(-1), serde_json::json!(2.5), serde_json::json!("3")] {
+            refused(
+                mem.search_with("q", "alice", 10, serde_json::json!({ "max_images": bad })).await.map(|_| ()),
+                "between 0 and 5",
+                "search_with",
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_null_max_images_is_read_as_absent() {
+        let ok = || http("200 OK", "", "{\"memories\":[],\"self_memories\":[]}");
+        let (base, hits) = mock_server((0..3).map(|_| ok()).collect());
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let none: Option<usize> = None;
+        let extra = || serde_json::json!({ "max_images": none });
+        mem.search_with("q", "alice", 10, extra()).await.expect("search_with");
+        mem.search_self_with("q", "alice", 10, extra()).await.expect("search_self_with");
+        mem.search_full_with("q", "alice", 10, &SearchOpts::default(), extra()).await.expect("search_full_with");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_memories_limit_is_1_to_500() {
+        let (base, hits) = mock_server(vec![]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        for bad in [0usize, 501, usize::MAX] {
+            refused(mem.list_memories("alice", bad, None).await.map(|_| ()), "between 1 and 500", "list_memories");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
+    }
+}
+
+#[cfg(test)]
+mod list_shape_tests {
+    //! A list keeps only the elements that are objects.
+    use super::tests::{http, mock_server};
+    use super::Client;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lists_keep_only_objects() {
+        let (base, _) = mock_server(vec![
+            http("200 OK", "", "{\"models\":[{\"id\":\"tablet-2\"},null,1,\"x\",[]]}"),
+            http("200 OK", "", "{\"collections\":[{\"user_id\":\"a\"},null,{\"user_id\":\"b\"},false]}"),
+            http("200 OK", "", "{\"turns\":[{\"user\":\"hi\"},null,\"t\"]}"),
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"},null,7],\"next_cursor\":null}"),
+            http("200 OK", "", "{\"images\":[{\"id\":\"a\"},null,\"b\"],\"has_more\":false}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.list_models().await.unwrap().len(), 1);
+        assert_eq!(mem.list_stores().await.unwrap().len(), 2);
+        assert_eq!(mem.history("alice").await.unwrap().len(), 1);
+        assert_eq!(mem.list_all_memories("alice").await.unwrap().len(), 1);
+        assert_eq!(mem.list_all_images("alice", None).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_cursor_ends_the_walk() {
+        let (base, hits) = mock_server(vec![
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":\"\"}"),
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":null}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.list_all_memories("alice").await.unwrap().len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let (base, hits) = mock_server(vec![
+            http("200 OK", "", "{\"images\":[{\"id\":\"a\"}],\"has_more\":true,\"next_before\":\"\"}"),
+            http("200 OK", "", "{\"images\":[{\"id\":\"a\"}],\"has_more\":false}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.list_all_images("alice", None).await.unwrap().len(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_repeated_cursor_after_a_page_with_no_objects_ends_the_walk() {
+        let (base, _) = mock_server(vec![
+            http("200 OK", "", "{\"memories\":[{\"id\":\"1\"}],\"next_cursor\":\"C\"}"),
+            http("200 OK", "", "{\"memories\":[null,7],\"next_cursor\":\"C\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.list_all_memories("alice").await.unwrap().len(), 1);
+
+        let page1 = "{\"images\":[{\"id\":\"a\"}],\"has_more\":true,\"next_before\":\"T\",\"next_skip_ids\":[\"a\"]}";
+        let page2 = "{\"images\":[null,\"b\"],\"has_more\":true,\"next_before\":\"T\",\"next_skip_ids\":[\"a\"]}";
+        let (base, _) = mock_server(vec![http("200 OK", "", page1), http("200 OK", "", page2)]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.list_all_images("alice", None).await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod delete_retry_tests {
+    //! A DELETE retried after an ambiguous failure may find its target already gone.
+    use super::tests::{dropping_server, http, mock_server};
+    use super::{Client, ErrorKind};
+
+    const NOTE: &str = "(an earlier attempt may already have deleted it)";
+    const GONE: &str = "{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"Store not found.\",\"request_id\":\"req_gone\"}}";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_404_after_an_ambiguous_retry_says_so() {
+        for first in ["502 Bad Gateway", "504 Gateway Timeout", "503 Service Unavailable", "408 Request Timeout"] {
+            let (base, _) = mock_server(vec![
+                http(first, "Retry-After: 0\r\n", "{\"error\":\"late\"}"),
+                http("404 Not Found", "", GONE),
+                http(first, "Retry-After: 0\r\n", "{\"error\":\"late\"}"),
+                http("404 Not Found", "", GONE),
+            ]);
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+            for e in [
+                mem.delete_store("tenant_a").await.unwrap_err(),
+                mem.remove_speaker("Bob", "tenant_a").await.unwrap_err(),
+            ] {
+                assert_eq!(e.kind(), ErrorKind::NotFound, "after {first}: {e}");
+                let shown = format!("{e}");
+                assert!(shown.ends_with(NOTE), "after {first}: {shown}");
+                assert!(shown.contains("req_gone"), "after {first}: {shown}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_404_after_a_dropped_response_says_so() {
+        let (base, _) = dropping_server(1, http("404 Not Found", "", GONE));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem
+            .forget_image("tenant_a", "11111111-1111-1111-1111-111111111111", false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        assert!(format!("{e}").ends_with(NOTE), "got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_preview_404_after_an_ambiguous_retry_says_nothing_more() {
+        // A preview deletes nothing, so no earlier attempt can have deleted it.
+        let (base, hits) = mock_server(vec![
+            http("503 Service Unavailable", "Retry-After: 0\r\n", "{\"error\":\"late\"}"),
+            http("404 Not Found", "", GONE),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem
+            .forget_image("tenant_a", "11111111-1111-1111-1111-111111111111", true)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound, "got {e}");
+        assert!(!format!("{e}").contains("earlier attempt"), "got {e}");
+        assert!(format!("{e}").contains("req_gone"), "got {e}");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (base, _) = mock_server(vec![
+            http("503 Service Unavailable", "Retry-After: 0\r\n", "{\"error\":\"late\"}"),
+            http("404 Not Found", "", GONE),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem
+            .forget_image("tenant_a", "11111111-1111-1111-1111-111111111111", false)
+            .await
+            .unwrap_err();
+        assert!(format!("{e}").ends_with(NOTE), "got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_404_without_an_ambiguous_attempt_says_nothing_more() {
+        let (base, _) = mock_server(vec![
+            http("404 Not Found", "", GONE),
+            http("429 Too Many Requests", "Retry-After: 0\r\n", "{\"error\":\"slow\"}"),
+            http("404 Not Found", "", GONE),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        for e in [
+            mem.delete_store("tenant_a").await.unwrap_err(),
+            mem.delete_store("tenant_a").await.unwrap_err(),
+        ] {
+            assert_eq!(e.kind(), ErrorKind::NotFound);
+            assert!(!format!("{e}").contains("earlier attempt"), "got {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_warning_tests {
+    //! The service keeps four metadata keys. Any other key is warned about once.
+    use super::tests::{http, mock_server};
+    use super::{Client, WARNED_METADATA_KEYS};
+
+    fn warned(key: &str) -> bool {
+        WARNED_METADATA_KEYS
+            .get()
+            .map(|m| m.lock().unwrap().contains(key))
+            .unwrap_or(false)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_add_warns_on_an_unknown_metadata_key() {
+        let ok = || http("200 OK", "", "{\"id\":\"m1\"}");
+        let (base, _) = mock_server(vec![ok(), ok(), ok(), ok(), ok()]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let md = |k: &str| serde_json::json!({ k: "x", "speaker": "me", "event_date": "2026-03-14",
+                                                 "category": "work", "conversation_id": "c1" });
+        mem.add("x", "alice", md("speakr_mdw_add")).await.unwrap();
+        mem.store("x", "alice", md("speakr_mdw_store")).await.unwrap();
+        mem.add_idempotent("x", "alice", md("speakr_mdw_idem"), "k1").await.unwrap();
+        mem.add_with("x", "alice", md("speakr_mdw_with"), serde_json::json!({})).await.unwrap();
+        mem.add_with_idempotent("x", "alice", md("speakr_mdw_withidem"), serde_json::json!({}), "k2")
+            .await
+            .unwrap();
+        for k in ["speakr_mdw_add", "speakr_mdw_store", "speakr_mdw_idem", "speakr_mdw_with", "speakr_mdw_withidem"] {
+            assert!(warned(k), "{k} was not warned about");
+        }
+        for k in ["speaker", "event_date", "category", "conversation_id"] {
+            assert!(!warned(k), "{k} is kept by the service and must not warn");
+        }
+    }
+}
+
+#[cfg(test)]
+mod search_full_with_tests {
+    //! `search_full_with`: free-form fields and the typed options in one call, with
+    //! every field of the answer kept.
+    use super::tests::{http, mock_server_recording};
+    use super::{Client, SearchOpts, WosError, WARNED_FILTER_KEYS};
+
+    fn body(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw.split("\r\n\r\n").nth(1).expect("no body")).expect("not JSON")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn filters_and_images_travel_together() {
+        let payload = "{\"memories\":[{\"id\":\"m1\"}],\"self_memories\":[{\"id\":\"s1\"}],\
+                       \"images\":[{\"id\":\"i1\"}],\"verify_used\":1}";
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", payload)]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let r = mem
+            .search_full_with(
+                "photos from june",
+                "alice",
+                10,
+                &SearchOpts { max_images: Some(3), ..Default::default() },
+                serde_json::json!({
+                    "filters": {"event_from": "2026-06-01", "event_to": "2026-06-30"},
+                    "speaker": "Bob",
+                    "max_images": 1,
+                    "user_id": "bob",
+                    "query": "smuggled",
+                    "max_results": 50,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.memories.len(), 1);
+        assert_eq!(r.self_memories.len(), 1);
+        assert_eq!(r.images.len(), 1);
+        assert_eq!(r.verify_used, Some(1));
+        let b = body(&seen.lock().unwrap()[0]);
+        assert_eq!(b["filters"]["event_from"], "2026-06-01");
+        assert_eq!(b["speaker"], "Bob");
+        assert_eq!(b["max_images"], 3, "opts win over extra");
+        assert_eq!(b["user_id"], "alice", "reserved fields win over extra");
+        assert_eq!(b["query"], "photos from june");
+        assert_eq!(b["max_results"], 10);
+        assert!(b.get("verify").is_none(), "an unset option is not sent");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unknown_filters_are_warned_about_and_limits_checked() {
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{\"memories\":[]}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        match mem
+            .search_full_with("q", "alice", 50, &SearchOpts::default(), serde_json::json!({}))
+            .await
+        {
+            Err(WosError::Api { status: 400, message }) => assert!(message.contains("between 5 and 20")),
+            other => panic!("expected a local refusal, got {other:?}"),
+        }
+        mem.search_full_with(
+            "q",
+            "alice",
+            10,
+            &SearchOpts::default(),
+            serde_json::json!({"filters": {"evnt_from_sfw": "2026-01-01"}}),
+        )
+        .await
+        .unwrap();
+        let hit = WARNED_FILTER_KEYS
+            .get()
+            .map(|m| m.lock().unwrap().contains("evnt_from_sfw"))
+            .unwrap_or(false);
+        assert!(hit, "an unknown filter key must be warned about");
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the valid call is sent");
+    }
+}
+
+#[cfg(test)]
+mod error_body_drop_tests {
+    //! A non-2xx answer whose body stops mid-stream.
+    use super::tests::{http, mock_server};
+    use super::{Client, WosError};
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+
+    /// Headers that promise 100 bytes, then 3 of them and a hang-up.
+    fn cut(status: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{\"e"
+        )
+    }
+
+    const STORES: &str = "{\"collections\":[],\"count\":0}";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_whose_error_body_drops_reports_its_status() {
+        for (status, code) in [("500 Internal Server Error", 500), ("404 Not Found", 404), ("409 Conflict", 409), ("400 Bad Request", 400)] {
+            let (base, hits) = mock_server(vec![cut(status), http("200 OK", "", STORES)]);
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+            match mem.list_stores().await {
+                Err(WosError::Api { status: s, message }) if s == code => {
+                    assert!(message.contains("could not be read"), "{status}: got {message}")
+                }
+                other => panic!("{status}: got {other:?}"),
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "{status}");
+        }
+        let (base, hits) = mock_server(vec![cut("500 Internal Server Error"), http("200 OK", "", "{\"deleted\":true}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert_eq!(mem.delete_store("tenant_a").await.unwrap_err().status(), Some(500));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_whose_error_body_drops_is_not_sent_again() {
+        let (base, hits) = mock_server(vec![cut("500 Internal Server Error"), http("200 OK", "", "{\"id\":\"m1\"}")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        match mem.add("hello", "alice", serde_json::json!({})).await {
+            Err(WosError::Api { status: 500, message }) => {
+                assert!(message.contains("could not be read"), "got {message}")
+            }
+            other => panic!("expected the 500, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a write is attempted exactly once");
+    }
+
+    /// The first connection gets `first` and is held open for 6s, so a body it cuts
+    /// short stalls rather than drops. Every later connection gets `then`.
+    fn stalling_server(first: String, then: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let n = h.fetch_add(1, Ordering::SeqCst);
+                let mut chunk = [0u8; 8192];
+                let _ = sock.read(&mut chunk);
+                if n > 0 {
+                    let _ = sock.write_all(then.as_bytes());
+                    continue;
+                }
+                let _ = sock.write_all(first.as_bytes());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                    drop(sock);
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    /// `cut`, with extra header lines.
+    fn cut_with(status: &str, headers: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n{headers}\r\n{{\"e"
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_error_body_that_stalls_is_not_sent_again() {
+        let (base, hits) = stalling_server(cut("500 Internal Server Error"), http("200 OK", "", STORES));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_timeout(1);
+        match mem.list_stores().await {
+            Err(WosError::Api { status: 500, .. }) => {}
+            other => panic!("expected the 500, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a timeout is not a drop");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_429_whose_body_stalls_is_sent_again_without_waiting_for_the_body() {
+        let (base, hits) = stalling_server(
+            cut_with("429 Too Many Requests", "Retry-After: 0\r\n"),
+            http("200 OK", "", "{\"id\":\"m1\"}"),
+        );
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_timeout(4);
+        let t0 = std::time::Instant::now();
+        let got = mem.add("hello", "alice", serde_json::json!({})).await;
+        assert!(got.is_ok(), "got {got:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "waited {:?}", t0.elapsed());
+    }
+
+    /// Headers at once, the body 1.5s later: past the brief wait a retried answer gets.
+    fn late_body_server(head: &str, body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (head, body) = (head.to_string(), body.to_string());
+        std::thread::spawn(move || {
+            while let Ok((mut sock, _)) = listener.accept() {
+                let (head, body) = (head.clone(), body.clone());
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 8192];
+                    let _ = sock.read(&mut chunk);
+                    let _ = sock.write_all(
+                        format!("{head}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let _ = sock.write_all(body.as_bytes());
+                });
+            }
+        });
+        base
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_429_that_is_not_retried_waits_for_its_body() {
+        let body = r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#;
+        for (retry_after, retries) in [("60", 2), ("0", 0)] {
+            let head = format!("HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: {retry_after}\r\n");
+            let base = late_body_server(&head, body);
+            let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_timeout(4).with_retries(retries);
+            let e = mem.stats("alice").await.unwrap_err();
+            assert_eq!(e.status(), Some(429), "{e:?}");
+            assert!(e.to_string().contains("slow down"), "Retry-After {retry_after}: {e}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_does_not_wait_for_a_429_body_that_stalls() {
+        let (base, hits) = stalling_server(
+            cut_with("429 Too Many Requests", "Retry-After: 0\r\n"),
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPNG!".to_string(),
+        );
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_timeout(4);
+        let t0 = std::time::Instant::now();
+        let (bytes, _) = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap();
+        assert_eq!(bytes, b"PNG!");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "waited {:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_503_whose_body_stalls_is_sent_again_inside_the_deadline() {
+        let (base, hits) = stalling_server(
+            cut_with("503 Service Unavailable", "Retry-After: 0\r\n"),
+            http("200 OK", "", STORES),
+        );
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_timeout(4)
+            .with_deadline(std::time::Duration::from_secs(3));
+        let got = mem.list_stores().await;
+        assert!(got.is_ok(), "got {got:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retryable_answer_whose_body_does_not_arrive_says_so() {
+        // The 2s wait fits the deadline when the answer arrives and no longer does after
+        // the brief wait for its body, so this answer ends the call.
+        let (base, hits) = stalling_server(
+            cut_with("503 Service Unavailable", "Retry-After: 2\r\n"),
+            http("200 OK", "", STORES),
+        );
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_timeout(4)
+            .with_deadline(std::time::Duration::from_millis(2500));
+        match mem.list_stores().await {
+            Err(WosError::Api { status: 503, message }) => {
+                assert!(message.contains("could not be read: not received within 1s"), "got {message}")
+            }
+            other => panic!("expected the 503, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_429_whose_body_stalls_on_the_last_attempt_reports_the_429() {
+        // Nothing follows, so the body is waited for until the attempt ends; the status
+        // stands when it never comes.
+        let (base, hits) = stalling_server(
+            cut_with("429 Too Many Requests", "Retry-After: 0\r\n"),
+            http("200 OK", "", STORES),
+        );
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_timeout(2).with_retries(0);
+        match mem.list_stores().await {
+            Err(WosError::Api { status: 429, .. }) => {}
+            other => panic!("expected the 429, got {other:?}"),
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

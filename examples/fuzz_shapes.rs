@@ -1,12 +1,11 @@
-//! Fuzz the Rust SDK against hostile 2xx bodies (run with the scratchpad mock server).
+//! Fuzz the client against hostile 2xx bodies. Needs a local mock server that answers
+//! each case name in `CASES` as a path prefix.
 //!
 //! PASS = the call returns Ok, or returns a typed `WosError`.
 //! BUG  = a hostile shape makes a call fail that should have degraded gracefully
-//!        (e.g. serde hard-erroring on `null` and dropping an entire batch), or a panic.
+//!        (e.g. one `null` element costing an entire batch), or a panic.
 //!
 //!   cargo run --example fuzz_shapes -- 18777
-//!
-//! Not part of the published test suite; a scratch harness for release bug hunts.
 
 use wontopos::Client;
 
@@ -65,11 +64,10 @@ async fn main() {
 
     println!("\nrust: {ran} calls, {} returned Err", errs.len());
 
-    // Classify. A body that is not an object at all SHOULD be a typed error
-    // ("expected a JSON object in the response") — Python/TS do the same, so that
-    // is graceful, not a bug. The real defect is a WELL-FORMED object whose
-    // memory ARRAY holds a bad element: Python/TS skip/coerce it and return the
-    // good memories, while Rust hard-errors and drops the whole batch.
+    // Classify. A body that is not an object at all is a typed error ("expected a
+    // JSON object in the response"), which is graceful. A WELL-FORMED object whose
+    // memory ARRAY holds a bad element must still return the good memories, so an
+    // error there is a bug candidate.
     let mut graceful = 0;
     let mut hard: Vec<&(String, String, String)> = Vec::new();
     for e in &errs {
