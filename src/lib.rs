@@ -629,9 +629,8 @@ pub struct SearchFull {
 /// `Client::new(key).with_model("tablet-1")`. What each model can do is listed in
 /// [`Client::list_models`] `capabilities`.
 ///
-/// Every model on the shared pool lists, fetches and deletes the same memories, but a
-/// search may not find memories stored through a different model. Store and search
-/// with the same one.
+/// Models on the shared pool read the same memory, so you can store with one and recall
+/// with another.
 const DEFAULT_MODEL: &str = "tablet-2";
 
 /// A page walk stops after this many pages: at 100 per page that is two million
@@ -1024,6 +1023,23 @@ fn parse_error(text: &str) -> (String, Option<String>) {
     (clean(text), None)
 }
 
+/// POST routes that only read. When the deadline cuts short a retry of one, the answer
+/// before it still describes the call, as for an idempotent method.
+const READ_POSTS: &[&str] = &[
+    "/api/v1/memory/search",
+    "/api/v1/memory/recall",
+    "/api/v1/memory/get",
+    "/api/v1/memory/list",
+    "/api/v1/memory/stats",
+    "/api/v1/memory/history",
+    "/api/v1/memory/lineage",
+    "/api/v1/memory/by-speaker",
+    "/api/v1/memory/images",
+    "/api/v1/memory/image",
+    "/api/v1/engram/run",
+    "/api/v1/won/revisions",
+];
+
 /// How long a retryable answer's error body may take to arrive.
 const RETRYABLE_BODY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -1402,9 +1418,8 @@ impl Client {
     ///
     /// `capabilities` says what the model can do (`forms`, `images`, `re_ask`,
     /// `self_memories`, `engrams`, `speaker_names`); check it before relying on one.
-    /// `memory` is `"shared"` or `"isolated"`. Every model on the shared pool lists,
-    /// fetches and deletes the same memories, but a search may not find memories stored
-    /// through a different model, so store and search with the same one.
+    /// `memory` is `"shared"` or `"isolated"`. Models on the shared pool read the same
+    /// memory, so you can store with one and recall with another.
     pub async fn list_models(&self) -> Result<Vec<serde_json::Value>, WosError> {
         let v = self.request(reqwest::Method::GET, "/api/v1/models", None, None).await?;
         Ok(records(&v, "models"))
@@ -2871,6 +2886,7 @@ impl Client {
         let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
         let idempotent = method.is_idempotent();
+        let reads = idempotent || (method == reqwest::Method::POST && READ_POSTS.contains(&path.split('?').next().unwrap_or(path)));
         // Set once an attempt ended without saying whether it was applied.
         let mut maybe_applied = false;
         let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
@@ -2906,7 +2922,7 @@ impl Client {
                     // The deadline ran out mid-attempt. A read reports the answer before
                     // it; otherwise the caller hears that the deadline ran out.
                     if ran_out_of_budget(&e, budget, per_attempt) {
-                        return Err(match previous.filter(|_| idempotent) {
+                        return Err(match previous.filter(|_| reads) {
                             Some(r) => r.into_error(removes),
                             None => self.deadline_error(),
                         });
@@ -2989,7 +3005,7 @@ impl Client {
             let text = match read_capped(resp).await {
                 Ok(t) => t,
                 Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
-                    return Err(match previous.filter(|_| idempotent) {
+                    return Err(match previous.filter(|_| reads) {
                         Some(r) => r.into_error(removes),
                         None => self.deadline_error(),
                     });
@@ -4848,6 +4864,17 @@ mod retry_wait_tests {
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
             .with_deadline(std::time::Duration::from_millis(600));
         let e = mem.list_stores().await.unwrap_err();
+        assert_eq!(e.status(), Some(429), "got {e:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_search_whose_last_attempt_runs_out_of_budget_reports_the_429() {
+        // A POST that only reads: the 429 before the cut still describes the call.
+        let (base, hits) = limited_then_stalls(std::time::Duration::from_secs(2));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base)
+            .with_deadline(std::time::Duration::from_millis(1200));
+        let e = mem.search("q", "alice", 10).await.unwrap_err();
         assert_eq!(e.status(), Some(429), "got {e:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
