@@ -482,8 +482,8 @@ where
     Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
-/// One retrieved memory. Known fields are typed; everything else (e.g. `speaker`:
-/// `"me"` for the assistant's own words, or a person's name) lands in `extra`.
+/// One retrieved memory. Known fields are typed, `speaker` among them (`"me"` for the
+/// assistant's own words, or a person's name); everything else lands in `extra`.
 #[derive(Debug, Deserialize)]
 pub struct Memory {
     #[serde(default, deserialize_with = "null_to_default")]
@@ -1420,6 +1420,9 @@ impl Client {
     /// `self_memories`, `engrams`, `speaker_names`); check it before relying on one.
     /// `memory` is `"shared"` or `"isolated"`. Models on the shared pool read the same
     /// memory, so you can store with one and recall with another.
+    ///
+    /// `retires_at` (RFC3339) is present on a live model that is scheduled to retire.
+    /// From that instant the model leaves this list and calls naming it are refused.
     pub async fn list_models(&self) -> Result<Vec<serde_json::Value>, WosError> {
         let v = self.request(reqwest::Method::GET, "/api/v1/models", None, None).await?;
         Ok(records(&v, "models"))
@@ -1451,6 +1454,11 @@ impl Client {
     /// `conversation_id`. Every other key is dropped, and this client warns once per
     /// unknown key on stderr. `event_date` takes RFC3339 or a plain date (YYYY-MM-DD);
     /// a value that is not a date is refused (400) naming the field.
+    ///
+    /// Returns `{ "id", "status" }`. When something was saved, `status` starts with
+    /// `"stored"` and can carry more text, so match on the prefix. It is `"duplicate"`
+    /// when nothing was saved. A duplicate can arrive with an empty `id` and no
+    /// `duplicate_of`; then search with the same text to find the memory it matched.
     pub async fn add(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value) -> Result<serde_json::Value, WosError> {
         self.store_one(content, user_id, metadata, serde_json::json!({}), None).await
     }
@@ -2054,11 +2062,11 @@ impl Client {
 
     /// List a store's stored memories — the text you stored, plus its metadata.
     /// Paginated: pass the returned `next_cursor` back as `cursor` for the next page,
-    /// and only a cursor the service returned. A null `next_cursor` means the last
-    /// page, but the last page can also carry one; the call after it then returns an
-    /// empty page. Use it to browse or export a store. `limit` and `cursor` accept
-    /// `None` (defaults: 100, first page). `limit` is 1 to 500; out of range is refused
-    /// before sending. Returns `{ "memories": [...], "count", "next_cursor" }`.
+    /// and only a cursor the service returned, with the model that returned it. A null
+    /// `next_cursor` means the last page, but the last page can also carry one; the call
+    /// after it then returns an empty page. Use it to browse or export a store. `limit`
+    /// and `cursor` accept `None` (defaults: 100, first page). `limit` is 1 to 500; out
+    /// of range is refused before sending. Returns `{ "memories": [...], "count", "next_cursor" }`.
     pub async fn list_memories(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -2313,7 +2321,7 @@ impl Client {
     /// the window. Never another key's. `balance_cents` is account-wide, since that is
     /// what gates the next call whichever key makes it.
     ///
-    /// `stores` is busiest first and at most 50 rows — a longer list is cut, so the rows
+    /// `stores` is highest spend first and at most 50 rows — a longer list is cut, so the rows
     /// need not sum to `workspace`. A row named `other` is an overflow bucket, not a
     /// store: passing it as a store id finds nothing.
     ///
@@ -2433,8 +2441,8 @@ impl Client {
     /// otherwise a person's name. Same cursor paging as `list_images`; `limit` is 5 to
     /// 20, and out of range is refused before sending.
     ///
-    /// `points_to_delete` is the count to show before anyone confirms a delete of this
-    /// speaker's memories.
+    /// `records_to_delete` is the count to show before anyone confirms a delete of this
+    /// speaker's memories; `points_to_delete` is the same number under its old name.
     pub async fn by_speaker(
         &self,
         speaker: &str,
