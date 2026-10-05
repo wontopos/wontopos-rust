@@ -262,6 +262,7 @@ fn valid_idempotency_key(k: &str) -> bool {
         && k.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 const ENV_KEYS: [&str; 2] = ["WONTOPOS_API_KEY", "WOS_API_KEY"];
+const GONE_HINT: &str = "This model is retired; list_models() lists the ones you can use.";
 
 /// Error returned by the Wontopos API.
 #[derive(Debug)]
@@ -400,7 +401,7 @@ pub enum ErrorKind {
     /// implement that endpoint, so retrying can never succeed. Pick a model that
     /// supports it ([`Client::list_models`]) instead.
     Server,
-    /// Any other status.
+    /// Any other status. A `410` is among them: see [`WosError::is_gone`].
     Other,
 }
 
@@ -440,6 +441,12 @@ impl WosError {
     /// True for a 401 auth failure.
     pub fn is_auth(&self) -> bool {
         self.kind() == ErrorKind::Auth
+    }
+    /// True for a 410: the model this call named is retired. Retrying cannot succeed:
+    /// name a live model instead ([`Client::list_models`] lists them).
+    /// [`Client::delete_store`] still works under a retired model.
+    pub fn is_gone(&self) -> bool {
+        self.status() == Some(410)
     }
 }
 
@@ -1098,17 +1105,20 @@ impl Refusal {
             _ if status_is_retryable(status, idempotent) => planned,
             _ => None,
         };
+        // A retired model says what to do whether or not its body could be read.
+        let gone = |m: String| if status == 410 { format!("{m} {GONE_HINT}") } else { m };
         let message = match text {
             Ok(t) => {
                 let (message, request_id) = parse_error(&t);
                 let message = if message.trim().is_empty() { format!("HTTP {status}") } else { message };
+                let message = gone(message);
                 match request_id {
                     Some(id) => format!("{message} (request_id: {id})"),
                     None => message,
                 }
             }
-            Err(WosError::Api { message, .. }) => message,
-            Err(e) => format!("the error body could not be read: {e}"),
+            Err(WosError::Api { message, .. }) => gone(message),
+            Err(e) => gone(format!("the error body could not be read: {e}")),
         };
         Refusal { status, message, wait }
     }
@@ -5097,6 +5107,26 @@ mod error_surface_tests {
         let e = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::NotFound);
         assert!(format!("{e}").contains("req_img"), "got {e}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retired_model_is_gone_says_what_to_do_and_is_not_retried() {
+        let body = "{\"type\":\"error\",\"error\":{\"type\":\"gone_error\",\"message\":\"Scroll 1 now exists only in memory.\",\"code\":0,\"request_id\":\"req_410\"}}";
+        let (base, hits) = mock_server(vec![
+            http("410 Gone", "", body),
+            http("410 Gone", "", body),
+            http("410 Gone", "", body),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.search("q", "alice", 10).await.unwrap_err();
+        assert!(e.is_gone(), "got {e}");
+        assert!(!e.is_auth());
+        assert_eq!(e.kind(), ErrorKind::Other);
+        let shown = format!("{e}");
+        assert!(shown.contains("Scroll 1 now exists only in memory."), "{shown}");
+        assert!(shown.contains("list_models()"), "{shown}");
+        assert!(shown.ends_with("(request_id: req_410)"), "{shown}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a 410 is not retried");
     }
 
     #[tokio::test(flavor = "current_thread")]

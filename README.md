@@ -133,6 +133,10 @@ match mem.search("...", "alice", 10).await {
 }
 ```
 
+A retired model answers `410`, and `e.is_gone()` is true: retrying cannot succeed, so
+name a live model (`list_models()` lists them, with `retires_at` on one that is
+scheduled to retire). `delete_store` still works under a retired model.
+
 ## A different API host
 
 Point the client somewhere other than the default endpoint - a dedicated region,
