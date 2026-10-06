@@ -8,7 +8,7 @@ serde_json = "1"                                 # metadata is passed as JSON
 ```
 
 Get an API key in the [console](https://wontopos.com). Keys look like `wos-live-...`;
-the client also reads `WONTOPOS_API_KEY` from the environment.
+`Client::from_env()` reads `WONTOPOS_API_KEY` from the environment instead.
 
 ```rust
 use wontopos::{Client, WosError};
@@ -159,14 +159,14 @@ Found something wrong, or something that looks unsafe? Tell us — every report 
 - Security: <https://wontopos.com/contact?topic=security> (also published at
   [`/.well-known/security.txt`](https://wontopos.com/.well-known/security.txt))
 
-Include the SDK version (`the version in Cargo.toml`) and the language. If it involves a store id or a
+Include the SDK version (the one in Cargo.toml) and the language. If it involves a store id or a
 memory, describe the shape rather than pasting the contents — we do not need your
 data to fix it.
 
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Eight inside 2.2 were not, deliberately and each with its
+releases are additive. Nine inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-rust/blob/main/CHANGELOG.md).

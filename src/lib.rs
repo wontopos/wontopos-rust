@@ -23,8 +23,8 @@
 //! and jitter, honoring `Retry-After` up to 30s. 429, and a 409 saying another write
 //! to the store was in flight, are retried on every call; 408/502/503/504 and network
 //! errors only when a retry cannot apply a write twice (idempotent calls, or a failure
-//! at connect time). Timeouts are never retried: the write may already have been
-//! applied. A `Retry-After` above 30s, or a wait that does not fit in the
+//! at connect time). A timeout after the request went out is not retried on any call;
+//! one at connect time is. A `Retry-After` above 30s, or a wait that does not fit in the
 //! [`Client::with_deadline`] budget, returns that response's error at once.
 //! Requests time out after 30s (connect 10s). Tune with
 //! [`Client::with_retries`] (0 disables) and [`Client::with_timeout`].
@@ -474,6 +474,22 @@ fn parse_rate_limit(h: &reqwest::header::HeaderMap) -> Option<RateLimit> {
     }
 }
 
+/// The reply as an object whose `keys` are arrays of objects, read as [`records`] reads
+/// a listing: a missing or null list becomes `[]` and a row that is not an object is
+/// dropped. Other fields pass through.
+fn with_lists(v: serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    let lists: Vec<(String, Vec<serde_json::Value>)> =
+        keys.iter().map(|k| ((*k).to_string(), records(&v, k))).collect();
+    let mut obj = match v {
+        serde_json::Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
+    for (k, list) in lists {
+        obj.insert(k, serde_json::Value::Array(list));
+    }
+    serde_json::Value::Object(obj)
+}
+
 /// Deserialize a field the server should always send, falling back to the type's
 /// default when it is `null` or will not convert, so one odd field does not cost the
 /// caller the whole record.
@@ -691,7 +707,7 @@ fn check_context_limit(n: usize) -> Result<(), WosError> {
         return Err(WosError::Api {
             status: 400,
             message: format!(
-                "context_limit must be between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}."
+                "context_limit must be an integer between {CONTEXT_LIMIT_MIN} and {CONTEXT_LIMIT_MAX}, got {n}."
             ),
         });
     }
@@ -703,7 +719,7 @@ fn check_search_limit(limit: usize) -> Result<(), WosError> {
         return Err(WosError::Api {
             status: 400,
             message: format!(
-                "limit must be between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. \
+                "limit must be an integer between {SEARCH_LIMIT_MIN} and {SEARCH_LIMIT_MAX}, got {limit}. \
                  Out of range is refused rather than adjusted, so a short answer always \
                  means the store was short."
             ),
@@ -718,7 +734,7 @@ fn check_page_limit(name: &str, n: usize) -> Result<(), WosError> {
     if !(PAGE_LIMIT_MIN..=PAGE_LIMIT_MAX).contains(&n) {
         return Err(WosError::Api {
             status: 400,
-            message: format!("{name} must be between {PAGE_LIMIT_MIN} and {PAGE_LIMIT_MAX}, got {n}."),
+            message: format!("{name} must be an integer between {PAGE_LIMIT_MIN} and {PAGE_LIMIT_MAX}, got {n}."),
         });
     }
     Ok(())
@@ -728,7 +744,7 @@ fn check_list_limit(n: usize) -> Result<(), WosError> {
     if !(LIST_LIMIT_MIN..=LIST_LIMIT_MAX).contains(&n) {
         return Err(WosError::Api {
             status: 400,
-            message: format!("limit must be between {LIST_LIMIT_MIN} and {LIST_LIMIT_MAX}, got {n}."),
+            message: format!("limit must be an integer between {LIST_LIMIT_MIN} and {LIST_LIMIT_MAX}, got {n}."),
         });
     }
     Ok(())
@@ -743,7 +759,7 @@ fn check_max_images(body: &serde_json::Value) -> Result<(), WosError> {
         Some(n) if n <= MAX_IMAGES_MAX as u64 => Ok(()),
         _ => Err(WosError::Api {
             status: 400,
-            message: format!("max_images must be a whole number between 0 and {MAX_IMAGES_MAX}, got {v}."),
+            message: format!("max_images must be an integer between 0 and {MAX_IMAGES_MAX}, got {v}."),
         }),
     }
 }
@@ -1321,6 +1337,8 @@ impl Client {
     /// use it to set the default (`Client::new(k).with_model("tablet-1")`) or to
     /// override one call (`client.with_model("tablet-1").recall(...)`).
     pub fn with_model(&self, model: &str) -> Self {
+        // "" sends no model header, so the service's default answers, as in Python and
+        // TypeScript. Any other name, whitespace included, must be a valid one.
         self.clone_with(Some(model), None)
     }
 
@@ -1449,7 +1467,8 @@ impl Client {
     /// Returns the whole object: `{ engrams: [...], forms: [...], note? }`. `note`
     /// explains an empty `engrams` on a model without engram support.
     pub async fn list_engrams(&self) -> Result<serde_json::Value, WosError> {
-        self.request(reqwest::Method::GET, "/api/v1/engram", None, None).await
+        let v = self.request(reqwest::Method::GET, "/api/v1/engram", None, None).await?;
+        Ok(with_lists(v, &["engrams", "forms"]))
     }
 
     // ----- write -----
@@ -2341,7 +2360,7 @@ impl Client {
         if !(1..=365).contains(&days) {
             return Err(WosError::Api {
                 status: 400,
-                message: format!("days must be between 1 and 365, got {days}."),
+                message: format!("days must be an integer between 1 and 365, got {days}."),
             });
         }
         self.request(
@@ -2357,8 +2376,8 @@ impl Client {
     ///
     /// `include` picks which side: `"revised"` or `"unrevised"`. One side per call; there
     /// is no way to ask for both lists in a single response, which is what keeps this
-    /// usable on a store with a hundred million memories. An unrecognised value is
-    /// rejected by the service rather than silently ignored.
+    /// usable on a store with a hundred million memories. Any other value is refused
+    /// before sending.
     ///
     /// Paging is by cursor, like [`Client::list_images`]: hand `next_before` and
     /// `next_skip_ids` back as `before` / `skip_ids`. Both are needed because several
@@ -2408,6 +2427,13 @@ impl Client {
         before: impl Into<Option<&str>>,
         skip_ids: Option<&[String]>,
     ) -> Result<serde_json::Value, WosError> {
+        // The service's 400 for this names no field, so it is refused here.
+        if include != "revised" && include != "unrevised" {
+            return Err(WosError::Api {
+                status: 400,
+                message: format!("include must be \"revised\" or \"unrevised\", got {include:?}."),
+            });
+        }
         let user_id = self.uid(user_id.into())?;
         let mut body = serde_json::json!({ "user_id": user_id, "include": include });
         if let Some(l) = limit.into() {
@@ -2603,7 +2629,8 @@ impl Client {
     pub async fn list_speakers(&self, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         let query = [("user_id", user_id)];
-        self.request(reqwest::Method::GET, "/api/v1/memory/speakers", None, Some(&query)).await
+        let v = self.request(reqwest::Method::GET, "/api/v1/memory/speakers", None, Some(&query)).await?;
+        Ok(with_lists(v, &["speakers"]))
     }
 
     /// Unregister a person. Their memories stay; the name tag goes. A 404 after an
@@ -2653,7 +2680,7 @@ impl Client {
 
     /// The checks every request makes before it opens a socket.
     fn preflight(&self) -> Result<(), WosError> {
-        if !valid_model(&self.model) {
+        if !self.model.is_empty() && !valid_model(&self.model) {
             return Err(WosError::Api {
                 status: 400,
                 message: format!(
@@ -2762,15 +2789,11 @@ impl Client {
                 Ok(b) => b,
                 Err(e) => return Err(previous.map_or(e, |r| r.into_error(false))),
             };
-            let sent = self
-                .http
-                .post(&url)
-                .header("X-API-Key", &self.api_key)
-                .header("X-WOS-Model", &self.model)
-                .json(body)
-                .timeout(budget)
-                .send()
-                .await;
+            let mut req = self.http.post(&url).header("X-API-Key", &self.api_key);
+            if !self.model.is_empty() {
+                req = req.header("X-WOS-Model", &self.model);
+            }
+            let sent = req.json(body).timeout(budget).send().await;
             let r = match sent {
                 Ok(r) => r,
                 Err(e) if e.is_builder() => return Err(builder_error(e)),
@@ -2922,8 +2945,10 @@ impl Client {
                 .http
                 .request(method.clone(), &url)
                 .timeout(budget)
-                .header("X-API-Key", &self.api_key)
-                .header("X-WOS-Model", &self.model);
+                .header("X-API-Key", &self.api_key);
+            if !self.model.is_empty() {
+                req = req.header("X-WOS-Model", &self.model);
+            }
             if let Some(k) = idempotency_key {
                 req = req.header("Idempotency-Key", k);
             }
@@ -5015,7 +5040,7 @@ mod retry_wait_tests {
 #[cfg(test)]
 mod error_surface_tests {
     //! What an error shows, and what it keeps.
-    use super::tests::{http, mock_server};
+    use super::tests::{http, mock_server, mock_server_recording};
     use super::{Client, ErrorKind, WosError};
     use std::sync::atomic::Ordering;
 
@@ -5127,6 +5152,35 @@ mod error_surface_tests {
         assert!(shown.contains("list_models()"), "{shown}");
         assert!(shown.ends_with("(request_id: req_410)"), "{shown}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a 410 is not retried");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_model_name_means_the_default_and_listings_have_their_lists() {
+        let (base, reqs) = mock_server_recording(vec![
+            http("200 OK", "", "{\"speakers\":[null,1,{\"speaker\":\"Bob\"}]}"),
+            http("200 OK", "", "{\"note\":\"no engrams on this model\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_model("");
+        let s = mem.list_speakers("alice").await.unwrap();
+        assert_eq!(s["speakers"], serde_json::json!([{"speaker": "Bob"}]));
+        let e = mem.list_engrams().await.unwrap();
+        assert_eq!(e["engrams"], serde_json::json!([]));
+        assert_eq!(e["forms"], serde_json::json!([]));
+        assert_eq!(e["note"], "no engrams on this model");
+        let first = reqs.lock().unwrap()[0].to_lowercase();
+        assert!(!first.contains("x-wos-model"), "the service's default answers: {first}");
+        let spaced = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_model(" ");
+        assert!(spaced.list_speakers("alice").await.is_err(), "whitespace is not the default");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revisions_include_is_checked_before_sending() {
+        let (base, hits) = mock_server(vec![]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let e = mem.revisions_page("alice", "both", None::<usize>, None::<&str>, None).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::BadRequest);
+        assert!(format!("{e}").contains("include must be \"revised\" or \"unrevised\""), "{e}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing may reach the network");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5263,7 +5317,8 @@ mod error_surface_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn get_image_checks_the_model_name_before_sending() {
         let (base, hits) = mock_server(vec![]);
-        for bad in ["bad model", "", "bad\r\nX-Evil: 1"] {
+        // An empty name is the default model now, as in Python and TypeScript.
+        for bad in ["bad model", "bad\r\nX-Evil: 1"] {
             let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_model(bad);
             match mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await {
                 Err(WosError::Api { status: 400, message }) => {
