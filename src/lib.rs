@@ -16,14 +16,14 @@
 //! `default` store, so with `None` everywhere the zero-setup path just works.
 //!
 //! Recall quality does not depend on which language a memory was written in: a
-//! memory stored in one language is found by a question asked in another. Storing
-//! and searching call no LLM.
+//! memory stored in one language is found by a question asked in another. No language
+//! model reads your stored memories.
 //!
 //! Reliability: every call retries transient failures with exponential backoff
 //! and jitter, honoring `Retry-After` up to 30s. 429, and a 409 saying another write
 //! to the store was in flight, are retried on every call; 408/502/503/504 and network
-//! errors only when a retry cannot apply a write twice (idempotent calls, or a failure
-//! at connect time). A timeout after the request went out is not retried on any call;
+//! errors only when a retry cannot apply a write twice (reads, the DELETE calls, or a
+//! failure at connect time). A timeout after the request went out is not retried on any call;
 //! one at connect time is. A `Retry-After` above 30s, or a wait that does not fit in the
 //! [`Client::with_deadline`] budget, returns that response's error at once.
 //! Requests time out after 30s (connect 10s). Tune with
@@ -383,7 +383,8 @@ pub enum ErrorKind {
     BadRequest,
     /// 401 — missing or invalid API key.
     Auth,
-    /// 402 — no card on file or depleted balance.
+    /// 402 — no card on file, depleted balance, or the month's spend cap for the
+    /// account's tier reached. Top up to continue; a top-up also raises the tier.
     PaymentRequired,
     /// 403 — not allowed.
     PermissionDenied,
@@ -578,9 +579,9 @@ pub struct RecallResponse {
 #[derive(Debug, Clone, Default)]
 pub struct SearchOpts {
     /// Re-ask passes, 0–3. After the first answer the service asks again up to this
-    /// many times, and each extra pass reaches memories the earlier ones did not. No
-    /// LLM runs at any value. It stops early when a pass finds nothing new; the
-    /// response's `verify_used` says how many actually ran.
+    /// many times, and each extra pass reaches memories the earlier ones did not.
+    /// Raising it adds no language model call. It stops early when a pass finds nothing
+    /// new; the response's `verify_used` says how many passes added memories.
     ///
     /// Each pass can add up to `limit` more memories, and delivered memories are
     /// billed, so it costs more. Helps most on questions needing several distinct
@@ -641,8 +642,8 @@ pub struct SearchFull {
     /// Image memories the answer carried (one by default on a model whose
     /// `capabilities` include `images`, up to `max_images`); empty when there were none.
     pub images: Vec<Memory>,
-    /// Re-ask passes actually performed. `None` unless `verify` was sent; lower than
-    /// requested means the store had nothing further to add.
+    /// Re-ask passes that added memories. `None` unless `verify` above 0 was sent;
+    /// lower than requested means a pass found nothing new, or could not run.
     pub verify_used: Option<u8>,
     /// The response as it arrived, for anything this struct does not name yet.
     pub raw: serde_json::Value,
@@ -892,8 +893,9 @@ fn far_future() -> std::time::Instant {
 /// Whether a status may be sent again, given whether the method can be replayed.
 /// 429 is refused before the request is processed, so nothing was written and any
 /// method may retry. The rest are ambiguous for a write: 408, 502, 503 and 504 can
-/// arrive after the write was applied, so they retry only when the method is
-/// idempotent. A 409 is decided from its body; see `write_lock_wait`.
+/// arrive after the write was applied, so they retry only a call that only reads (an
+/// idempotent method, or a POST in `READ_POSTS`). A 409 is decided from its body; see
+/// `write_lock_wait`.
 fn status_is_retryable(status: u16, idempotent: bool) -> bool {
     status == 429 || (matches!(status, 408 | 502 | 503 | 504) && idempotent)
 }
@@ -995,7 +997,8 @@ fn normalize_image_b64(s: &str) -> String {
 /// Normalise an `image` object in place: `{"data": ..., "reference"?, "taken_at"?}`.
 ///
 /// Sizes are left to the service, which refuses what it cannot take: a request body
-/// over 10MB, an edge under 700px. A long edge over 1568px is downscaled, not refused.
+/// over 10MB, an image file over 7MB, an edge under 700px, a long edge over 2500px.
+/// Between 1568px and 2500px the long edge is downscaled, not refused.
 fn normalize_image_field(image: &mut serde_json::Value) -> Result<(), WosError> {
     let bad = |m: &str| WosError::Api { status: 400, message: m.to_string() };
     let obj = image
@@ -1046,8 +1049,9 @@ fn parse_error(text: &str) -> (String, Option<String>) {
     (clean(text), None)
 }
 
-/// POST routes that only read. When the deadline cuts short a retry of one, the answer
-/// before it still describes the call, as for an idempotent method.
+/// POST routes that only read: retried like an idempotent method on 408/502/503/504 and
+/// a dropped answer, and when the deadline cuts short a retry of one, the answer before
+/// it still describes the call.
 const READ_POSTS: &[&str] = &[
     "/api/v1/memory/search",
     "/api/v1/memory/recall",
@@ -1152,7 +1156,7 @@ impl Refusal {
 
 /// Wontopos memory client. Memories are isolated per `user_id`.
 ///
-/// The API key picks *which memory* (your account); the model picks *which engine*
+/// The API key picks *which memory* (your workspace); the model picks *which engine*
 /// reads it. Set a default with [`Client::with_model`], or
 /// override for a single call by chaining it:
 ///
@@ -1442,7 +1446,7 @@ impl Client {
     }
 
     /// Available models: `[{ "id", "name", "available", "memory", "capabilities" }, ...]`.
-    /// Needs no API key. Elements that are not objects are skipped.
+    /// Elements that are not objects are skipped.
     ///
     /// `capabilities` says what the model can do (`forms`, `images`, `re_ask`,
     /// `self_memories`, `engrams`, `speaker_names`); check it before relying on one.
@@ -1517,11 +1521,13 @@ impl Client {
     /// sent, the service keeps no image bytes: [`Client::get_image`] answers 404 for
     /// that memory, and you fetch the picture from your reference.
     ///
-    /// Limits: the request body is at most 10MB, both edges must be 700px or more (a
-    /// smaller image is refused, 400), and a long edge over 1568px is downscaled to 1568.
-    /// Downscaling re-encodes: lossless formats are written as WebP, so a PNG comes back
-    /// from [`Client::get_image`] as `image/webp`; JPEG stays JPEG. Under 1568px the
-    /// bytes are untouched. Keep the full-resolution file yourself.
+    /// Limits: the request body is at most 10MB and the image file 7MB, both edges must
+    /// be 700px or more and the long edge at most 2500px (anything else is refused, 400,
+    /// with the reason), and a long edge over 1568px is downscaled to 1568. Downscaling
+    /// re-encodes: lossless formats are written as WebP, so a PNG comes back from
+    /// [`Client::get_image`] as `image/webp`; JPEG stays JPEG, and a re-encode that would
+    /// be bigger is dropped. Under 1568px the bytes are untouched. Keep the
+    /// full-resolution file yourself.
     pub async fn add_with(&self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value, extra: serde_json::Value) -> Result<serde_json::Value, WosError> {
         self.store_one(content, user_id, metadata, extra, None).await
     }
@@ -1710,15 +1716,17 @@ impl Client {
 
     // ----- read -----
 
-    /// Search stored memories. Returns them most relevant first.
+    /// Search stored memories. They come most relevant first; the assistant's own words
+    /// and image memories, when there are any, follow them in their own order.
     ///
     /// `limit` is 5..=20, and out of range is refused rather than clamped: asking for
     /// 50 and silently receiving 20 reads as "that is all there is".
     ///
-    /// `limit` bounds `memories`, not the returned `Vec`. The assistant's own words
-    /// (on a model whose [`Client::list_models`] `capabilities` include
-    /// `self_memories`) and image memories (with `images`, one unless `max_images` says
-    /// otherwise) come back in it as well, so it can hold more than `limit`. Size a
+    /// `limit` bounds `memories`, not the returned `Vec`, and each `verify` pass can add
+    /// up to `limit` more. The assistant's own words (on a model whose
+    /// [`Client::list_models`] `capabilities` include `self_memories`) and image memories
+    /// (with `images`, one unless `max_images` says otherwise) come back after them in it
+    /// as well, so it can hold more than `limit`. Size a
     /// prompt window on what you get back, not on `limit`. [`Client::search_full`]
     /// hands the fields back apart.
     pub async fn search(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<Vec<Memory>, WosError> {
@@ -1733,14 +1741,15 @@ impl Client {
     /// `json!({"speaker": "Bob"})` to recall one person's words only, or
     /// `json!({"tz": 9})` / `json!({"form": "memoir"})`.
     ///
-    /// Recall caching is not free to switch on: a hit inside the TTL bills at 0.1x,
-    /// but the FIRST call writes the cache and bills the query tokens at 2x (`5m`)
-    /// or 3x (`1h`). It pays for a query you repeat or extend and costs more for one
+    /// Recall caching is not free to switch on: the same query again inside the TTL
+    /// bills at 0.1x, and one that extends the cached query bills only its cached part
+    /// at 0.1x, the new part at the write rate and its results at the normal rate. The
+    /// FIRST call writes the cache and bills the query tokens at 2x (`5m`) or 3x (`1h`). It pays for a query you repeat or extend and costs more for one
     /// you issue once, so do not set it on every search.
     ///
-    /// It also carries `filters`, which narrows the search to part of a store. The
-    /// filter chooses what is searched, not what is kept afterwards — so a narrow
-    /// filter still returns your full `limit` when that many matches sit inside it:
+    /// It also carries `filters`, which narrows the search to part of a store. A narrow
+    /// filter can return fewer than `limit` even when the store holds more inside it. A
+    /// memory stored without an `event_date` is matched by when it was stored:
     ///
     /// ```no_run
     /// # use wontopos::Client; use serde_json::json;
@@ -1839,7 +1848,7 @@ impl Client {
     /// let r = mem.search_full("the day we moved", "alice", 10,
     ///                         &SearchOpts { max_images: Some(3), verify: Some(2), ..Default::default() }).await?;
     /// r.images.len();   // the photos, apart from the text memories
-    /// r.verify_used;    // re-ask passes that actually ran
+    /// r.verify_used;    // re-ask passes that added memories
     /// # Ok(()) }
     /// ```
     pub async fn search_full(
@@ -2061,16 +2070,16 @@ impl Client {
         Ok(records(&v, "turns"))
     }
 
-    /// Memory counts for a store.
+    /// Memory counts for a store. `total_memories` can be larger than the number
+    /// `list_memories` lists.
     pub async fn stats(&self, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
         self.post("/api/v1/memory/stats", serde_json::json!({"user_id": user_id})).await
     }
 
     /// Fetch ONE memory by id — the text you stored, and its metadata.
-    /// The id is what `add`/`store` or `list_memories` returned. Same visibility
-    /// as `list_memories`: an id from another store, an id `list_memories` does not
-    /// return, or an invalidated memory is a 404 (`ErrorKind::NotFound`).
+    /// The id is what `add`/`store` or `list_memories` returned. An unknown id or one
+    /// from another store is a 404 (`ErrorKind::NotFound`).
     pub async fn get(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
         if memory_id.trim().is_empty() {
             return Err(WosError::Api {
@@ -2120,10 +2129,10 @@ impl Client {
     /// Fetch the bytes of an image memory → `(bytes, content_type)`.
     ///
     /// This is the picture the SERVICE holds, not necessarily your upload — in size or
-    /// in format. An image whose long edge was over 1568px was downscaled to 1568 on the
-    /// way in and re-encoded (lossless formats as WebP, so a PNG comes back as
-    /// `image/webp`; JPEG stays JPEG), and that smaller picture is what is stored and
-    /// comes back here. Keep your own copy if you need the full-resolution file.
+    /// in format. An image whose long edge was over 1568px (2500 at most) was
+    /// downscaled to 1568 on the way in and re-encoded (lossless formats as WebP, so a
+    /// PNG comes back as `image/webp`; JPEG stays JPEG; kept as sent when the re-encode
+    /// came out bigger), and that smaller picture is what is stored and comes back here. Keep your own copy if you need the full-resolution file.
     ///
     /// The type is sniffed from the BYTES, not from whatever the upload was named, so
     /// take the file extension from the returned type rather than from what you sent.
@@ -2346,9 +2355,9 @@ impl Client {
     /// Free: no charge and no balance gate, because an account at zero still has to be
     /// able to find out why. Rate-limited instead.
     ///
-    /// Scoped to THIS key: its own lifetime spend, plus its workspace and stores over
-    /// the window. Never another key's. `balance_cents` is account-wide, since that is
-    /// what gates the next call whichever key makes it.
+    /// `key` is THIS key's own lifetime spend. `workspace` and `stores` cover the window
+    /// for the workspace this key belongs to, every key in it included. `balance_cents`
+    /// is account-wide, since that is what gates the next call whichever key makes it.
     ///
     /// `stores` is highest spend first and at most 50 rows — a longer list is cut, so the rows
     /// need not sum to `workspace`. A row named `other` is an overflow bucket, not a
@@ -2449,9 +2458,11 @@ impl Client {
         self.post("/api/v1/won/revisions", body).await
     }
 
-    /// The full chain of edits behind one memory, oldest first. `is_current` marks the
-    /// version in force. `revisions` says how much a store moved; this says what happened
-    /// to one fact.
+    /// The edits that followed one memory: from the id you pass forward to the version in
+    /// force, oldest first. `is_current` marks the version in force. The chain runs
+    /// forward only, so pass the first version's id to see the whole history; the
+    /// current version's id (what `search` returns) comes back alone. `revisions` says
+    /// how much a store moved; this says what happened to one fact.
     pub async fn lineage(
         &self,
         user_id: impl Into<Option<&str>>,
@@ -2633,7 +2644,9 @@ impl Client {
         Ok(with_lists(v, &["speakers"]))
     }
 
-    /// Unregister a person. Their memories stay; the name tag goes. A 404 after an
+    /// Unregister a person. Their memories stay, and the name can no longer tag a new
+    /// memory or filter a search. The tag goes from stored memories too, except on
+    /// `tablet-2`, which keeps it on memories already stored with it. A 404 after an
     /// attempt that may have been applied ends with "(an earlier attempt may already
     /// have deleted it)".
     pub async fn remove_speaker(&self, speaker: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
@@ -2766,9 +2779,9 @@ impl Client {
     /// Errors still arrive as JSON, so a non-2xx is decoded the same way as everywhere
     /// else and keeps `NotFound` / auth failures behaving identically.
     ///
-    /// Retries 429, a 409 for a write in flight, and connect-level failures, like
-    /// every other call. None of those carries an image, and a connect failure never
-    /// reached the server.
+    /// Retries like every other call that only reads: 429, a 409 for a write in flight
+    /// and connect-level failures, and also 408/502/503/504 and an answer that dropped
+    /// mid-body, since fetching an image again changes nothing.
     async fn request_bytes(
         &self,
         path: &str,
@@ -2782,7 +2795,10 @@ impl Client {
         // The answer that led to this attempt, reported if the budget runs out first.
         let mut last_refusal: Option<Refusal> = None;
         let mut attempt: u32 = 0;
-        let (resp, budget, previous) = loop {
+        // A POST that only reads (an image fetch) is safe to send again on a
+        // 408/502/503/504 or an answer that dropped mid-body, as the JSON reads are.
+        let reads = READ_POSTS.contains(&path.split('?').next().unwrap_or(path));
+        let (bytes, ctype, status) = loop {
             let start = std::time::Instant::now();
             let previous = last_refusal.take();
             let budget = match self.attempt_budget(deadline_at) {
@@ -2806,7 +2822,8 @@ impl Client {
                     // A connect-level failure never reached the server, so it can be sent
                     // again. That includes a CONNECT timeout, which reports both
                     // predicates; a timeout after the request went out is not retried.
-                    if e.is_connect() && attempt + 1 < attempts {
+                    // A read can also be sent again after any other transport failure.
+                    if (e.is_connect() || (reads && !e.is_timeout())) && attempt + 1 < attempts {
                         let delay = backoff(attempt);
                         if !fits_in(delay, deadline_at) {
                             return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
@@ -2828,7 +2845,7 @@ impl Client {
             self.record_rate_limit(r.headers());
             if !status.is_success() {
                 let left = budget.saturating_sub(start.elapsed());
-                let refusal = Refusal::read(r, false, attempt, attempt + 1 < attempts, deadline_at, left).await;
+                let refusal = Refusal::read(r, reads, attempt, attempt + 1 < attempts, deadline_at, left).await;
                 if let Some(delay) = refusal.wait {
                     if attempt + 1 < attempts && fits_in(delay, deadline_at) {
                         last_refusal = Some(refusal);
@@ -2839,21 +2856,30 @@ impl Client {
                 }
                 return Err(refusal.into_error(false));
             }
-            break (r, budget, previous);
-        };
-        let ctype = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let status = resp.status().as_u16();
-        let bytes = match read_capped_bytes(resp).await {
-            Ok(b) => b,
-            Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
-                return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+            let ctype = r
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let status = status.as_u16();
+            match read_capped_bytes(r).await {
+                Ok(b) => break (b, ctype, status),
+                Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
+                    return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+                }
+                // The answer dropped while its body was read: sent again, as above.
+                Err(WosError::Network(ne)) if reads && !ne.is_timeout() && attempt + 1 < attempts => {
+                    let delay = backoff(attempt);
+                    if !fits_in(delay, deadline_at) {
+                        return Err(previous.map_or_else(|| self.deadline_error(), |r| r.into_error(false)));
+                    }
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
         };
         if bytes.is_empty() {
             // An empty 200 would otherwise read as "here is your image" and write a
@@ -2926,8 +2952,10 @@ impl Client {
         // wrapped count would mean "do not retry".
         let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
-        let idempotent = method.is_idempotent();
-        let reads = idempotent || (method == reqwest::Method::POST && READ_POSTS.contains(&path.split('?').next().unwrap_or(path)));
+        // Safe to send again: an idempotent method, or a POST that only reads. Reads go as
+        // POST and were retried by method only, so search and recall never were.
+        let reads = method.is_idempotent()
+            || (method == reqwest::Method::POST && READ_POSTS.contains(&path.split('?').next().unwrap_or(path)));
         // Set once an attempt ended without saying whether it was applied.
         let mut maybe_applied = false;
         let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
@@ -2972,10 +3000,11 @@ impl Client {
                     }
                     // Retry only when a retry cannot apply a write twice:
                     //   · a connect-level failure — the request never reached the server
-                    //   · an idempotent method — re-running it changes nothing
+                    //   · a call that only reads (an idempotent method, or a read sent as
+                    //     POST) — re-running it changes nothing
                     // Timeouts are excluded from both: the write may already have been
                     // applied.
-                    let safe = e.is_connect() || (idempotent && !e.is_timeout());
+                    let safe = e.is_connect() || (reads && !e.is_timeout());
                     if safe && attempt + 1 < attempts {
                         let delay = backoff(attempt);
                         if !fits_in(delay, deadline_at) {
@@ -3008,7 +3037,7 @@ impl Client {
             self.record_rate_limit(resp.headers());
             if !status.is_success() {
                 let left = budget.saturating_sub(start.elapsed());
-                let refusal = Refusal::read(resp, idempotent, attempt, attempt + 1 < attempts, deadline_at, left).await;
+                let refusal = Refusal::read(resp, reads, attempt, attempt + 1 < attempts, deadline_at, left).await;
                 if let Some(delay) = refusal.wait {
                     if attempt + 1 < attempts && fits_in(delay, deadline_at) {
                         log_debug!(
@@ -3055,7 +3084,7 @@ impl Client {
                 }
                 Err(e) => {
                     let retry_body = match &e {
-                        WosError::Network(ne) => idempotent && !ne.is_timeout(),
+                        WosError::Network(ne) => reads && !ne.is_timeout(),
                         _ => false, // the size cap and friends are not transport failures
                     };
                     if retry_body && attempt + 1 < attempts {
@@ -3762,6 +3791,40 @@ mod tests {
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
         mem.list_models().await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2); // retried
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_image_is_retried_on_503_like_the_other_reads() {
+        // It runs through its own loop (bytes, not JSON), which had the retry flag fixed
+        // to "not safe".
+        let (base, hits) = mock_server(vec![
+            http("503 Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http("200 OK", "", "PNGBYTES"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let (bytes, _) = mem.get_image("u", "11111111-2222-3333-4444-555555555555").await.unwrap();
+        assert_eq!(bytes, b"PNGBYTES");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_sent_as_post_is_retried_on_503_and_a_write_is_not() {
+        // search and recall go as POST and were retried by method only.
+        let (base, hits) = mock_server(vec![
+            http("503 Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http("200 OK", "", "{\"memories\":[]}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        mem.search("q", "u", 5).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let (base, hits) = mock_server(vec![
+            http("503 Service Unavailable", "Retry-After: 0\r\n", "{}"),
+            http("200 OK", "", "{\"id\":\"m1\",\"status\":\"stored\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        assert!(mem.add("x", "u", serde_json::json!({})).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
