@@ -22,8 +22,9 @@
 //! Reliability: every call retries transient failures with exponential backoff
 //! and jitter, honoring `Retry-After` up to 30s. 429, and a 409 saying another write
 //! to the store was in flight, are retried on every call; 408/502/503/504 and network
-//! errors only when a retry cannot apply a write twice (reads, the DELETE calls, or a
-//! failure at connect time). A timeout after the request went out is not retried on any call;
+//! errors only when a retry cannot apply a write twice (reads, the DELETE calls, the
+//! memory writes, which carry an idempotency key, or a failure at connect time). A
+//! timeout after the request went out is not retried on any call;
 //! one at connect time is. A `Retry-After` above 30s, or a wait that does not fit in the
 //! [`Client::with_deadline`] budget, returns that response's error at once.
 //! Requests time out after 30s (connect 10s). Tune with
@@ -240,13 +241,77 @@ fn warn_on_unknown_metadata(metadata: &serde_json::Value) {
     }
 }
 
+/// Retirements already announced, as `model|day`, so each is said once per process.
+static WARNED_RETIREMENTS: WarnSet = std::sync::OnceLock::new();
+/// Past this many, no more are said: a server that sends a new date on every answer
+/// would otherwise grow the set, and the log, without end.
+const WARNED_RETIREMENTS_MAX: usize = 64;
+
+/// The day `t` falls on, in UTC, as `YYYY-MM-DD`.
+fn utc_day(t: std::time::SystemTime) -> String {
+    let days = t.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() / 86_400) as i64;
+    // Civil date from days since 1970-01-01 (the proleptic Gregorian calendar).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The service names the day a model retires in a `Sunset` header (RFC 8594) on the
+/// answers that model serves. Said once per model and day: without it the first sign
+/// is the 410 on the day, and a line on every call would be noise. True when it said so.
+fn warn_if_retiring(model: &str, headers: &reqwest::header::HeaderMap) -> bool {
+    let Some(v) = headers.get("sunset").and_then(|v| v.to_str().ok()) else { return false };
+    let Ok(when) = httpdate::parse_http_date(v.trim()) else { return false };
+    let day = utc_day(when);
+    let seen = WARNED_RETIREMENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    {
+        let Ok(mut g) = seen.lock() else { return false };
+        if g.len() >= WARNED_RETIREMENTS_MAX || !g.insert(format!("{model}|{day}")) {
+            return false;
+        }
+    }
+    let which = if model.is_empty() { "the model this client uses".to_string() } else { format!("model {model:?}") };
+    eprintln!(
+        "wontopos: {which} retires on {day} (UTC). From then on its calls answer 410, except \
+         delete_store. list_models() lists the models you can move to."
+    );
+    true
+}
+
+/// A key for a write that came without one: `sdk-` and 32 random hex digits. Without a
+/// rand dependency: each `RandomState` has fresh random keys, as in `backoff`, and a
+/// counter keeps two keys made in the same instant apart.
+fn new_idempotency_key() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let half = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(salt);
+        h.write_u64(n);
+        h.write_u128(now);
+        h.finish()
+    };
+    format!("sdk-{:016x}{:016x}", half(0), half(1))
+}
+
 /// Test hook — the warn-once sets are process-global by design.
 #[doc(hidden)]
 pub fn _reset_warning_state() {
     if let Some(m) = WARNED_STORE_IDS.get() {
         if let Ok(mut g) = m.lock() { g.clear(); }
     }
-    for set in [&WARNED_FILTER_KEYS, &WARNED_METADATA_KEYS] {
+    for set in [&WARNED_FILTER_KEYS, &WARNED_METADATA_KEYS, &WARNED_RETIREMENTS] {
         if let Some(m) = set.get() {
             if let Ok(mut g) = m.lock() { g.clear(); }
         }
@@ -390,8 +455,11 @@ pub enum ErrorKind {
     PermissionDenied,
     /// 404 — the store or resource doesn't exist.
     NotFound,
-    /// 409: another write to this store was in flight (retried automatically; nothing
-    /// was stored), or the store id collides with an existing one (not retried).
+    /// 409: another write to this store was in flight, or the first request under this
+    /// write's idempotency key is still running (both retried automatically; nothing was
+    /// stored); the store id collides with an existing one (not retried); or the first
+    /// request under the key did not come back with an answer, so whether it was stored
+    /// is not known (not retried: check before sending it again under a new key).
     Conflict,
     /// 429 — rate limited.
     RateLimited,
@@ -558,6 +626,8 @@ pub struct Memory {
 ///
 /// Fields this struct does not name land in `extra`. It is `#[non_exhaustive]`:
 /// destructure with a trailing `..` and build one with `serde_json::from_value`.
+/// [`RecallResponse::turns`], [`RecallResponse::memories`] and
+/// [`RecallResponse::context_rows`] read the three parts as types.
 #[derive(Debug, Deserialize)]
 #[non_exhaustive]
 pub struct RecallResponse {
@@ -568,6 +638,49 @@ pub struct RecallResponse {
     #[serde(default)]
     pub context: serde_json::Value,
     /// Every other field of the reply, as it arrived.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RecallResponse {
+    /// The recent conversation, oldest first. A row that is not an object is skipped.
+    pub fn turns(&self) -> Vec<Turn> {
+        records(&self.short_term, "turns")
+            .into_iter()
+            .filter_map(|t| serde_json::from_value(t).ok())
+            .collect()
+    }
+
+    /// The stored memories that match the query, best first.
+    pub fn memories(&self) -> Vec<Memory> {
+        memories_from(self.long_term.get("memories"))
+    }
+
+    /// The conversation around the best memory, in the order it was said. Each row is
+    /// text that starts with where it sits next to that memory: `[before] `, `[match] `
+    /// or `[after] `. Empty when there is no best memory or `context_limit` is 0.
+    pub fn context_rows(&self) -> Vec<String> {
+        self.context
+            .get("around_top_memory")
+            .and_then(|v| v.as_array())
+            .map(|rows| rows.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// One turn of the recent conversation, as [`RecallResponse::turns`] reads it.
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct Turn {
+    /// `"user"` or `"assistant"`.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub role: String,
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub content: String,
+    /// When it was said (RFC3339).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub timestamp: Option<String>,
+    /// Every other field of the turn, as it arrived.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -890,12 +1003,13 @@ fn far_future() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60 * 60 * 24 * 365)
 }
 
-/// Whether a status may be sent again, given whether the method can be replayed.
+/// Whether a status may be sent again, given whether the call can be replayed.
 /// 429 is refused before the request is processed, so nothing was written and any
 /// method may retry. The rest are ambiguous for a write: 408, 502, 503 and 504 can
-/// arrive after the write was applied, so they retry only a call that only reads (an
-/// idempotent method, or a POST in `READ_POSTS`). A 409 is decided from its body; see
-/// `write_lock_wait`.
+/// arrive after the write was applied, so they retry only a call that is safe to send
+/// again: one that only reads (an idempotent method, or a POST in `READ_POSTS`), or a
+/// write with an idempotency key, which the service answers with the first attempt's
+/// result. A 409 is decided from its body; see `write_lock_wait`.
 fn status_is_retryable(status: u16, idempotent: bool) -> bool {
     status == 429 || (matches!(status, 408 | 502 | 503 | 504) && idempotent)
 }
@@ -1579,7 +1693,7 @@ impl Client {
     /// Store a conversation turn (user + assistant). Payload first, user_id last — same shape as `add`/`search`.
     pub async fn add_turn(&self, user_msg: &str, assistant_msg: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        self.post("/api/v1/memory/store-turn", serde_json::json!({"user_id": user_id, "user_msg": user_msg, "assistant_msg": assistant_msg})).await
+        self.post_idem("/api/v1/memory/store-turn", serde_json::json!({"user_id": user_id, "user_msg": user_msg, "assistant_msg": assistant_msg}), None).await
     }
 
     /// Bulk-ingest a large blob of text in one call.
@@ -1663,22 +1777,28 @@ impl Client {
     /// Supersede an old memory with new content. Payload first, user_id last — same shape as `add`/`search`.
     pub async fn update(&self, old_memory_id: &str, new_content: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        self.post("/api/v1/memory/supersede", serde_json::json!({"user_id": user_id, "old_memory_id": old_memory_id, "new_content": new_content})).await
+        self.post_idem("/api/v1/memory/supersede", serde_json::json!({"user_id": user_id, "old_memory_id": old_memory_id, "new_content": new_content}), None).await
     }
 
     // ----- idempotent writes -----
     //
-    // An `idempotency_key` makes repeating THAT EXACT write safe: the API replays the
-    // first response instead of storing again (10 min), and answers 422 if the same key
-    // arrives with a different body. Use it when the retry is YOURS — a job that died and
-    // was re-run, a queue that redelivers. This client retries a write only where
-    // nothing was stored: a 429, or a 409 saying another write to the store was in
-    // flight. It never retries a write on 408 / 502 / 503 / 504 or a dropped body,
-    // where the first attempt may already have been applied — without a key the client
-    // cannot know whether it was.
+    // Every memory write (`add`, `add_turn`, `add_bulk`, `update` and their variants)
+    // carries an idempotency key: the one passed to these methods, or one this client
+    // makes for the call. With it the client retries the write on 408 / 502 / 503 / 504
+    // and on a dropped connection, as it does a read: the service answers a repeat with
+    // the first attempt's result instead of storing again, and one that arrives while the
+    // first is still running with a 409 to wait, which is retried too.
     //
-    // The key covers a retry sent after the first attempt finished. A retry that
-    // overlaps a first attempt still running can run twice.
+    // Pass your own key when the retry is YOURS: a job that died and was re-run, a queue
+    // that redelivers. The service keeps a key for 24 hours and answers a repeat with the
+    // first successful response, marked `"replayed": true`; the same key with a different
+    // body is refused (422). A first attempt that failed is not kept, so a repeat of it
+    // runs, unless it did not come back with an answer, so whether it was applied is not
+    // known: then the repeat is refused with a 409 (`ErrorKind::Conflict`) instead of
+    // storing it twice; check before sending it again under a new key. This client sets
+    // `replayed` only for a key you passed, and then the earlier request can also be an
+    // attempt of this same call that the client sent again after an answer that left the
+    // outcome open.
     //
     // The key must be UNIQUE PER LOGICAL WRITE — derive it from the thing being stored
     // (`format!("import:{}", row.id)`), never a constant, or the second write replays the
@@ -1686,8 +1806,6 @@ impl Client {
     // a `with_idempotency_key()` clone: a clone invites reuse across different writes,
     // which is exactly the mistake that loses data.
     //
-    // The window is best-effort and can be shorter than 10 minutes; it is not a durable
-    // de-duplication record.
     // Format: 1-128 chars of `[A-Za-z0-9._:-]`, rejected locally before the request.
 
     /// [`Client::add`] with an idempotency key.
@@ -2162,10 +2280,10 @@ impl Client {
         self.request_bytes("/api/v1/memory/image", &body).await
     }
 
-    /// Remove the IMAGE from a memory, keeping its text.
+    /// Remove the IMAGE from a memory. It can take the whole memory with it.
     ///
-    /// Pass `preview = true` to see the outcome first: it reports `memory_kept` and
-    /// changes nothing. Without a preview, a 404 after an attempt that may have been
+    /// Pass `preview = true` to see the outcome first: it reports `memory_kept` (`false`
+    /// when the memory itself would go) and changes nothing. Without a preview, a 404 after an attempt that may have been
     /// applied ends with "(an earlier attempt may already have deleted it)".
     pub async fn forget_image(
         &self,
@@ -2186,7 +2304,7 @@ impl Client {
             body["preview"] = serde_json::json!(true);
         }
         // A preview deletes nothing, so a 404 there never says it may already be gone.
-        self.send(reqwest::Method::DELETE, "/api/v1/memory/image", Some(&body), None, None, !preview).await
+        self.send(reqwest::Method::DELETE, "/api/v1/memory/image", Some(&body), None, None, !preview, false).await
     }
 
     /// One page of image memories, newest first, plus the store's TOTAL `count`.
@@ -2843,6 +2961,7 @@ impl Client {
                 });
             }
             self.record_rate_limit(r.headers());
+            warn_if_retiring(&self.model, r.headers());
             if !status.is_success() {
                 let left = budget.saturating_sub(start.elapsed());
                 let refusal = Refusal::read(r, reads, attempt, attempt + 1 < attempts, deadline_at, left).await;
@@ -2896,8 +3015,18 @@ impl Client {
         self.request(reqwest::Method::POST, path, Some(&body), None).await
     }
 
+    /// A memory write. It always carries an `Idempotency-Key`, the caller's or one made
+    /// for this call, so an answer that leaves the outcome open (408/502/503/504, a
+    /// dropped connection) can be retried: the service answers the retry with the first
+    /// attempt's result instead of storing again.
     async fn post_idem(&self, path: &str, body: serde_json::Value, key: Option<&str>) -> Result<serde_json::Value, WosError> {
-        self.request_with_key(reqwest::Method::POST, path, Some(&body), None, key).await
+        match key {
+            Some(k) => self.send(reqwest::Method::POST, path, Some(&body), None, Some(k), false, false).await,
+            None => {
+                let made = new_idempotency_key();
+                self.send(reqwest::Method::POST, path, Some(&body), None, Some(&made), false, true).await
+            }
+        }
     }
 
     async fn request(
@@ -2922,11 +3051,13 @@ impl Client {
         idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value, WosError> {
         let removes = method == reqwest::Method::DELETE;
-        self.send(method, path, body, query, idempotency_key, removes).await
+        self.send(method, path, body, query, idempotency_key, removes, false).await
     }
 
     /// The request loop. `removes` marks a call that deletes something, so a 404 after
-    /// an attempt that may have been applied can say it may already be gone.
+    /// an attempt that may have been applied can say it may already be gone. `made_key`
+    /// marks an idempotency key this client made, not the caller's.
+    #[allow(clippy::too_many_arguments)]
     async fn send(
         &self,
         method: reqwest::Method,
@@ -2935,6 +3066,7 @@ impl Client {
         query: Option<&[(&str, String)]>,
         idempotency_key: Option<&str>,
         removes: bool,
+        made_key: bool,
     ) -> Result<serde_json::Value, WosError> {
         if let Some(k) = idempotency_key {
             if !valid_idempotency_key(k) {
@@ -2956,6 +3088,12 @@ impl Client {
         // POST and were retried by method only, so search and recall never were.
         let reads = method.is_idempotent()
             || (method == reqwest::Method::POST && READ_POSTS.contains(&path.split('?').next().unwrap_or(path)));
+        // A write with an idempotency key is safe to send again too: the service answers a
+        // repeat with the first attempt's result, and one that arrives while the first is
+        // still running with a 409 to wait. Every memory write carries one. Only `reads`
+        // decides what a deadline that cuts a retry short reports: a keyed write may still
+        // have been applied by the attempt the deadline cut.
+        let replay_safe = reads || idempotency_key.is_some();
         // Set once an attempt ended without saying whether it was applied.
         let mut maybe_applied = false;
         let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
@@ -3002,9 +3140,12 @@ impl Client {
                     //   · a connect-level failure — the request never reached the server
                     //   · a call that only reads (an idempotent method, or a read sent as
                     //     POST) — re-running it changes nothing
-                    // Timeouts are excluded from both: the write may already have been
-                    // applied.
-                    let safe = e.is_connect() || (reads && !e.is_timeout());
+                    //   · a write with an idempotency key — the service answers a repeat
+                    //     with the first attempt's result
+                    // A timeout after the request went out is excluded from the last two:
+                    // the write may already have been applied. A connect timeout reports both
+                    // predicates and is the first kind: it never reached the server.
+                    let safe = e.is_connect() || (replay_safe && !e.is_timeout());
                     if safe && attempt + 1 < attempts {
                         let delay = backoff(attempt);
                         if !fits_in(delay, deadline_at) {
@@ -3035,9 +3176,10 @@ impl Client {
                 });
             }
             self.record_rate_limit(resp.headers());
+            warn_if_retiring(&self.model, resp.headers());
             if !status.is_success() {
                 let left = budget.saturating_sub(start.elapsed());
-                let refusal = Refusal::read(resp, reads, attempt, attempt + 1 < attempts, deadline_at, left).await;
+                let refusal = Refusal::read(resp, replay_safe, attempt, attempt + 1 < attempts, deadline_at, left).await;
                 if let Some(delay) = refusal.wait {
                     if attempt + 1 < attempts && fits_in(delay, deadline_at) {
                         log_debug!(
@@ -3071,9 +3213,9 @@ impl Client {
                 .map(|v| v == "true")
                 .unwrap_or(false);
             // A drop WHILE READING the body is not a connect error — `send()` already
-            // returned, so it surfaces here and nowhere else. Same rule as above: an
-            // idempotent read can be re-run safely, a write cannot (it may already have
-            // been applied). A timeout stays unretried either way.
+            // returned, so it surfaces here and nowhere else. Same rule as above: a read or
+            // a keyed write can be sent again safely, any other write cannot (it may
+            // already have been applied). A timeout stays unretried either way.
             let text = match read_capped(resp).await {
                 Ok(t) => t,
                 Err(WosError::Network(ne)) if ran_out_of_budget(&ne, budget, per_attempt) => {
@@ -3084,7 +3226,7 @@ impl Client {
                 }
                 Err(e) => {
                     let retry_body = match &e {
-                        WosError::Network(ne) => reads && !ne.is_timeout(),
+                        WosError::Network(ne) => replay_safe && !ne.is_timeout(),
                         _ => false, // the size cap and friends are not transport failures
                     };
                     if retry_body && attempt + 1 < attempts {
@@ -3142,8 +3284,9 @@ impl Client {
             }
             let mut v = v;
             // Only when the body does not already carry it: the service's own value
-            // is the true one.
-            if replayed {
+            // is the true one. Not for a key this client made: the caller's one call
+            // stored once, and `replayed` would tell them nothing was stored.
+            if replayed && !made_key {
                 if let Some(o) = v.as_object_mut() {
                     o.entry("replayed").or_insert(serde_json::Value::Bool(true));
                 }
@@ -3518,12 +3661,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_write_is_never_retried_when_the_body_drops_mid_stream() {
         // The other half, and the reason the rule is not simply "retry everything":
-        // headers came back, so the write may already have been applied.
+        // headers came back, so a write without a key may already have been applied.
+        let (base, hits) = dropping_server(1, http("200 OK", "", r#"{"status":"created"}"#));
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(2);
+        let got = mem.create_store("alice").await;
+        assert!(got.is_err(), "a dropped POST body must NOT be retried without a key");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the write must be attempted exactly once");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_memory_write_is_retried_when_the_body_drops_mid_stream() {
+        // A memory write carries a key: the service answers the repeat with the first result.
         let (base, hits) = dropping_server(1, http("200 OK", "", r#"{"id":"m1","status":"stored"}"#));
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_retries(2);
-        let got = mem.add("hello", "alice", serde_json::json!({})).await;
-        assert!(got.is_err(), "a dropped POST body must NOT be retried");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "the write must be attempted exactly once");
+        let got = mem.add("hello", "alice", serde_json::json!({})).await.unwrap();
+        assert_eq!(got["id"], "m1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one drop + one good response");
     }
 
     #[test]
@@ -3773,12 +3926,45 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn post_write_not_retried_on_502() {
-        // A 502 on a write (POST) must NOT retry — the write may already have been applied.
+        // A 502 on a write without a key must NOT retry — it may already have been applied.
         let (base, hits) = mock_server(vec![http("502 Bad Gateway", "", "{\"error\":\"bad gateway\"}")]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
-        let r = mem.add("hi", "u", serde_json::json!({})).await;
+        let r = mem.add_speaker("Bob", "u").await;
         assert!(matches!(r, Err(WosError::Api { status: 502, .. })));
         assert_eq!(hits.load(Ordering::SeqCst), 1); // no retry
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_memory_write_is_retried_on_502_under_one_key() {
+        let (base, seen) = mock_server_recording(vec![
+            http("502 Bad Gateway", "Retry-After: 0\r\n", "{\"error\":\"bad gateway\"}"),
+            http("200 OK", "Idempotent-Replayed: true\r\n", "{\"id\":\"m1\",\"status\":\"stored\"}"),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let r = mem.add("hi", "u", serde_json::json!({})).await.unwrap();
+        assert_eq!(r["id"], "m1");
+        assert!(r.get("replayed").is_none(), "the client's own retry is not the caller's replay");
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        let key = |r: &str| {
+            r.lines()
+                .find_map(|l| l.to_lowercase().strip_prefix("idempotency-key:").map(|v| v.trim().to_string()))
+                .expect("a key on every attempt")
+        };
+        let k = key(&reqs[0]);
+        assert!(k.starts_with("sdk-") && k.len() == 36 && k[4..].bytes().all(|b| b.is_ascii_hexdigit()), "{k}");
+        assert_eq!(key(&reqs[1]), k, "a retry must repeat the key, or it is a second write");
+    }
+
+    #[test]
+    fn made_keys_differ_and_have_the_right_shape() {
+        let a = new_idempotency_key();
+        let b = new_idempotency_key();
+        assert_ne!(a, b);
+        for k in [&a, &b] {
+            assert!(valid_idempotency_key(k));
+            assert!(k.starts_with("sdk-") && k.len() == 36, "{k}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3820,10 +4006,10 @@ mod tests {
 
         let (base, hits) = mock_server(vec![
             http("503 Service Unavailable", "Retry-After: 0\r\n", "{}"),
-            http("200 OK", "", "{\"id\":\"m1\",\"status\":\"stored\"}"),
+            http("200 OK", "", "{\"status\":\"created\"}"),
         ]);
         let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
-        assert!(mem.add("x", "u", serde_json::json!({})).await.is_err());
+        assert!(mem.create_store("u").await.is_err(), "a write without a key is not sent again");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
@@ -4012,11 +4198,12 @@ mod tests {
         mem.add_turn_idempotent("hi", "yo", "alice", "k2").await.unwrap();
         mem.add_bulk_idempotent("blob", "alice", "general", "k3").await.unwrap();
         mem.update_idempotent("m1", "new", "alice", "k4").await.unwrap();
-        mem.add("x", "alice", e).await.unwrap(); // no key → no header
+        mem.add("x", "alice", e).await.unwrap(); // no key → one the client made
         let reqs = seen.lock().unwrap();
         let keys: Vec<bool> = reqs.iter().map(|r| r.to_lowercase().contains("idempotency-key:")).collect();
-        assert_eq!(keys, vec![true, true, true, true, false], "reqs: {reqs:?}");
+        assert_eq!(keys, vec![true, true, true, true, true], "reqs: {reqs:?}");
         assert!(reqs[0].contains("import:row-42"));
+        assert!(reqs[4].contains("sdk-"), "reqs: {reqs:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5992,5 +6179,71 @@ mod error_body_drop_tests {
             other => panic!("expected the 429, got {other:?}"),
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod release_2247_tests {
+    use super::*;
+
+    #[test]
+    fn utc_day_reads_the_calendar() {
+        let at = |s: &str| httpdate::parse_http_date(s).unwrap();
+        assert_eq!(utc_day(at("Sat, 07 Nov 2026 00:00:00 GMT")), "2026-11-07");
+        assert_eq!(utc_day(at("Thu, 29 Feb 2024 23:59:59 GMT")), "2024-02-29");
+        assert_eq!(utc_day(at("Thu, 01 Jan 1970 00:00:00 GMT")), "1970-01-01");
+        assert_eq!(utc_day(at("Fri, 31 Dec 9999 23:59:59 GMT")), "9999-12-31");
+    }
+
+    // The warn-once set is process-global and these tests run in parallel, so each uses
+    // a model name of its own and none resets the set.
+    #[test]
+    fn a_retirement_is_said_once_per_model_and_day() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("sunset", "Sat, 07 Nov 2026 00:00:00 GMT".parse().unwrap());
+        assert!(warn_if_retiring("scroll-1-once", &h));
+        assert!(!warn_if_retiring("scroll-1-once", &h), "once per model and day");
+        h.insert("sunset", "Sun, 08 Nov 2026 00:00:00 GMT".parse().unwrap());
+        assert!(warn_if_retiring("scroll-1-once", &h), "a new day is news");
+        let mut bad = reqwest::header::HeaderMap::new();
+        bad.insert("sunset", "soon".parse().unwrap());
+        assert!(!warn_if_retiring("scroll-1-once", &bad), "not a date, nothing said");
+        assert!(!warn_if_retiring("scroll-1-once", &reqwest::header::HeaderMap::new()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_image_fetch_says_it_too() {
+        // get_image has a loop of its own; the warning must not depend on which loop ran.
+        use super::tests::{http, mock_server};
+        let (base, _) = mock_server(vec![http("200 OK", "Sunset: Sat, 07 Nov 2026 00:00:00 GMT\r\n", "PNGBYTES")]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base).with_model("scroll-1-image");
+        let (bytes, _) = mem.get_image("u", "11111111-2222-3333-4444-555555555555").await.unwrap();
+        assert_eq!(bytes, b"PNGBYTES");
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert("sunset", "Sat, 07 Nov 2026 00:00:00 GMT".parse().unwrap());
+        assert!(!warn_if_retiring("scroll-1-image", &h), "the image fetch already said it");
+    }
+
+    #[test]
+    fn recall_parts_read_as_types() {
+        let r: RecallResponse = serde_json::from_value(serde_json::json!({
+            "short_term": {"turns": [
+                {"role": "user", "content": "hi", "timestamp": "2026-10-13T09:00:00Z"},
+                "not a turn",
+                {"role": "assistant", "content": "hello", "timestamp": null}
+            ], "count": 2},
+            "long_term": {"memories": [{"id": "m1", "content": "she prefers tea"}], "count": 1},
+            "context": {"around_top_memory": ["[before] a", "[match] b", 3, "[after] c"], "count": 4}
+        }))
+        .unwrap();
+        let turns = r.turns();
+        assert_eq!(turns.len(), 2);
+        assert_eq!((turns[0].role.as_str(), turns[0].content.as_str()), ("user", "hi"));
+        assert_eq!(turns[0].timestamp.as_deref(), Some("2026-10-13T09:00:00Z"));
+        assert_eq!(turns[1].timestamp, None);
+        assert_eq!(r.memories()[0].content, "she prefers tea");
+        assert_eq!(r.context_rows(), vec!["[before] a", "[match] b", "[after] c"]);
+        let empty: RecallResponse = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.turns().is_empty() && empty.memories().is_empty() && empty.context_rows().is_empty());
     }
 }
