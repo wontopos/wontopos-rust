@@ -27,8 +27,9 @@
 //! timeout after the request went out is not retried on any call;
 //! one at connect time is. A `Retry-After` above 30s, or a wait that does not fit in the
 //! [`Client::with_deadline`] budget, returns that response's error at once.
-//! Requests time out after 30s (connect 10s). Tune with
-//! [`Client::with_retries`] (0 disables) and [`Client::with_timeout`].
+//! An attempt times out after 30s, or 200s for `add`, `add_turn`, `add_bulk` and their
+//! variants: storing a long text can take the service up to three minutes (connect 10s). Tune
+//! with [`Client::with_retries`] (0 disables) and [`Client::with_timeout`].
 //!
 //! Runtime: every call is async and needs a Tokio 1.x runtime with IO and time
 //! enabled (`#[tokio::main]` enables both). There is no blocking client.
@@ -879,6 +880,11 @@ fn check_max_images(body: &serde_json::Value) -> Result<(), WosError> {
 }
 const DEFAULT_USER: &str = "default";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+/// How long one attempt of `add`, `add_turn`, `add_bulk` and their variants waits when no
+/// timeout was set: storing a long text can take the service up to three minutes. A timeout set
+/// with [`Client::with_timeout`] applies to every call.
+const STORE_TIMEOUT_SECS: u64 = 200;
+const STORE_PATHS: [&str; 3] = ["/api/v1/memory/store", "/api/v1/memory/store-turn", "/api/v1/memory/bulk-store"];
 const DEFAULT_RETRIES: u32 = 2;
 
 /// `wos-abc...wxyz` — enough to tell keys apart, never enough to use.
@@ -1289,6 +1295,8 @@ pub struct Client {
     /// The store every call uses unless one passes `Some(user_id)`.
     default_user: String,
     timeout_secs: u64,
+    /// `timeout_secs` for `add`, `add_turn`, `add_bulk` and their variants.
+    store_timeout_secs: u64,
     /// A TOTAL budget for one call, across every attempt; `timeout_secs` bounds one
     /// attempt. `None` means no overall budget.
     deadline: Option<std::time::Duration>,
@@ -1422,6 +1430,7 @@ impl Client {
             model: DEFAULT_MODEL.to_string(),
             default_user: DEFAULT_USER.to_string(),
             timeout_secs: DEFAULT_TIMEOUT_SECS,
+            store_timeout_secs: STORE_TIMEOUT_SECS,
             retries: DEFAULT_RETRIES,
             http: build_http(DEFAULT_TIMEOUT_SECS),
             deadline: None,
@@ -1436,6 +1445,7 @@ impl Client {
             model: model.unwrap_or(&self.model).to_string(),
             default_user: user.unwrap_or(&self.default_user).to_string(),
             timeout_secs: self.timeout_secs,
+            store_timeout_secs: self.store_timeout_secs,
             deadline: self.deadline,
             retries: self.retries,
             http: self.http.clone(),
@@ -1495,8 +1505,8 @@ impl Client {
     fn attempt_budget(
         &self,
         deadline_at: Option<std::time::Instant>,
+        per_attempt: std::time::Duration,
     ) -> Result<std::time::Duration, WosError> {
-        let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
         let Some(at) = deadline_at else { return Ok(per_attempt) };
         let left = at.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -1505,13 +1515,22 @@ impl Client {
         Ok(per_attempt.min(left))
     }
 
-    /// Return a client with a different per-request timeout (each retry attempt).
-    /// `0` falls back to the default (30s) — a zero timeout would fail every request.
+    /// How long one attempt of a call to `path` waits.
+    fn attempt_timeout(&self, path: &str) -> std::time::Duration {
+        let path = path.split('?').next().unwrap_or(path);
+        let secs = if STORE_PATHS.contains(&path) { self.store_timeout_secs } else { self.timeout_secs };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Return a client with a different per-request timeout (each retry attempt). It
+    /// applies to every call, `add`, `add_turn`, `add_bulk` and their variants included.
+    /// `0` falls back to the defaults (200s for those, 30s for the rest) — a zero timeout would
+    /// fail every request.
     pub fn with_timeout(&self, timeout_secs: u64) -> Self {
-        let timeout_secs = if timeout_secs == 0 { DEFAULT_TIMEOUT_SECS } else { timeout_secs };
         let mut c = self.clone_with(None, None);
-        c.timeout_secs = timeout_secs;
-        c.http = build_http(timeout_secs);
+        (c.timeout_secs, c.store_timeout_secs) =
+            if timeout_secs == 0 { (DEFAULT_TIMEOUT_SECS, STORE_TIMEOUT_SECS) } else { (timeout_secs, timeout_secs) };
+        c.http = build_http(c.timeout_secs);
         c
     }
 
@@ -2909,7 +2928,7 @@ impl Client {
         let url = format!("{}{}", self.base_url, path);
         let attempts = self.retries.saturating_add(1);
         let deadline_at = self.deadline_at();
-        let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
+        let per_attempt = self.attempt_timeout(path);
         // The answer that led to this attempt, reported if the budget runs out first.
         let mut last_refusal: Option<Refusal> = None;
         let mut attempt: u32 = 0;
@@ -2919,7 +2938,7 @@ impl Client {
         let (bytes, ctype, status) = loop {
             let start = std::time::Instant::now();
             let previous = last_refusal.take();
-            let budget = match self.attempt_budget(deadline_at) {
+            let budget = match self.attempt_budget(deadline_at, per_attempt) {
                 Ok(b) => b,
                 Err(e) => return Err(previous.map_or(e, |r| r.into_error(false))),
             };
@@ -3096,14 +3115,14 @@ impl Client {
         let replay_safe = reads || idempotency_key.is_some();
         // Set once an attempt ended without saying whether it was applied.
         let mut maybe_applied = false;
-        let per_attempt = std::time::Duration::from_secs(self.timeout_secs);
+        let per_attempt = self.attempt_timeout(path);
         // The answer that led to this attempt, reported if the budget runs out first.
         let mut last_refusal: Option<Refusal> = None;
         let mut attempt: u32 = 0;
         loop {
             let start = std::time::Instant::now();
             let previous = last_refusal.take();
-            let budget = match self.attempt_budget(deadline_at) {
+            let budget = match self.attempt_budget(deadline_at, per_attempt) {
                 Ok(b) => b,
                 Err(e) => return Err(previous.map_or(e, |r| r.into_error(removes && maybe_applied))),
             };
@@ -3354,7 +3373,7 @@ mod tests {
             let c = Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk").with_deadline(d);
             let at = c.deadline_at().expect("a non-zero deadline is Some");
             assert!(at > std::time::Instant::now(), "{d:?} must resolve to a future instant");
-            assert!(c.attempt_budget(Some(at)).is_ok(), "{d:?} must leave a usable budget");
+            assert!(c.attempt_budget(Some(at), c.attempt_timeout("/api/v1/memory/store")).is_ok(), "{d:?} must leave a usable budget");
         }
         // ZERO still means "no budget", and an ordinary one still bounds the call.
         assert!(Client::new("wos-live-kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk")
@@ -4036,6 +4055,50 @@ mod tests {
                 assert!(message.contains("whitespace"), "got {message}");
             }
             other => panic!("expected whitespace-key error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn store_writes_wait_longer_unless_a_timeout_was_set() {
+        let mem = Client::new("wos-test-xxxxxxxxxx");
+        let secs = |c: &Client, p: &str| c.attempt_timeout(p).as_secs();
+        for p in ["/api/v1/memory/store", "/api/v1/memory/store-turn", "/api/v1/memory/bulk-store"] {
+            assert_eq!(secs(&mem, p), 200, "{p}");
+        }
+        for p in ["/api/v1/memory/supersede", "/api/v1/memory/search", "/api/v1/memory/recall", "/api/v1/memory/image"] {
+            assert_eq!(secs(&mem, p), 30, "{p}");
+        }
+        let set = mem.with_timeout(10);
+        assert_eq!((secs(&set, "/api/v1/memory/store"), secs(&set, "/api/v1/memory/search")), (10, 10));
+        // Clones keep "set" and "not set" apart.
+        assert_eq!(secs(&set.with_model("tablet-1"), "/api/v1/memory/bulk-store"), 10);
+        assert_eq!(secs(&set.with_timeout(0), "/api/v1/memory/store"), 200);
+        assert_eq!(secs(&mem.with_user("bob"), "/api/v1/memory/store-turn"), 200);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_form_of_add_add_turn_and_add_bulk_gets_the_store_timeout() {
+        // The timeout is chosen by path, so each public form must post to a store path.
+        let (base, seen) = mock_server_recording(vec![http("200 OK", "", "{}"); 11]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let meta = serde_json::json!({});
+        mem.add("x", "alice", meta.clone()).await.unwrap();
+        mem.store("x", "alice", meta.clone()).await.unwrap();
+        mem.add_with("x", "alice", meta.clone(), meta.clone()).await.unwrap();
+        mem.add_with_idempotent("x", "alice", meta.clone(), meta.clone(), "k1").await.unwrap();
+        mem.add_idempotent("x", "alice", meta.clone(), "k2").await.unwrap();
+        mem.add_turn("hi", "yo", "alice").await.unwrap();
+        mem.add_turn_idempotent("hi", "yo", "alice", "k3").await.unwrap();
+        mem.add_bulk("blob", "alice", "general").await.unwrap();
+        mem.add_bulk_with("blob", "alice", "general", meta.clone()).await.unwrap();
+        mem.add_bulk_with_idempotent("blob", "alice", "general", meta.clone(), "k4").await.unwrap();
+        mem.add_bulk_idempotent("blob", "alice", "general", "k5").await.unwrap();
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 11);
+        for r in reqs.iter() {
+            let path = r.split_whitespace().nth(1).unwrap_or_default();
+            assert!(STORE_PATHS.contains(&path), "{path}");
+            assert_eq!(mem.attempt_timeout(path).as_secs(), STORE_TIMEOUT_SECS, "{path}");
         }
     }
 
