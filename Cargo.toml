@@ -1,0 +1,33 @@
+[package]
+name = "wontopos"
+version = "2.2.49"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
+homepage = "https://wontopos.com"
+repository = "https://github.com/wontopos/wontopos-rust"
+readme = "README.md"
+# Test-only files stay out of the crate: the fixtures in src/testdata and the sleep's tests in src/sleep/tests
+# are read only by #[cfg(test)] code, which a published crate never compiles.
+exclude = ["examples/fuzz_shapes.rs", "src/testdata/", "src/sleep/tests/"]
+keywords = ["memory", "ai", "agent", "llm", "multilingual"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+futures-util = "0.3"
+# Tiny, dependency-free HTTP-date parser (also used transitively by reqwest) —
+# lets retry_wait() honor a `Retry-After` given as an HTTP-date, not just seconds.
+httpdate = "1"
+# The IANA time zone database, built in, for the router's clock (`RouterOptions::time_zone`): the date,
+# weekday and time on the person's clock, daylight saving included, on every platform. `chrono` comes
+# with `chrono-tz` and is named here because its `TimeZone` trait is how a zone is read and its RFC 3339
+# parser checks a turn's `created_at`; its default features stay off, so it brings nothing `chrono-tz` does not.
+chrono-tz = "0.10"
+chrono = { version = "0.4", default-features = false }
+
+# SDK is a standalone crate — kept out of the workspace so it can be published independently.
+[workspace]
