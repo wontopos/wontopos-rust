@@ -1,7 +1,8 @@
 [package]
 name = "wontopos"
-version = "2.2.49"
+version = "2.2.50"
 edition = "2021"
+rust-version = "1.83"
 license = "MIT OR Apache-2.0"
 description = "Wontopos — long-term memory for AI agents. Identical recall in every language, ~100× lower LLM bill."
 homepage = "https://wontopos.com"
@@ -9,7 +10,7 @@ repository = "https://github.com/wontopos/wontopos-rust"
 readme = "README.md"
 # Test-only files stay out of the crate: the fixtures in src/testdata and the sleep's tests in src/sleep/tests
 # are read only by #[cfg(test)] code, which a published crate never compiles.
-exclude = ["examples/fuzz_shapes.rs", "src/testdata/", "src/sleep/tests/"]
+exclude = ["examples/fuzz_shapes.rs", "src/testdata/", "src/sleep/tests/", "src/tests.rs", "src/**/*_tests.rs"]
 keywords = ["memory", "ai", "agent", "llm", "multilingual"]
 categories = ["api-bindings", "asynchronous"]
 

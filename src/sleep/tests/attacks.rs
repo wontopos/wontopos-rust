@@ -87,7 +87,7 @@ fn night_rows(n: usize, night: &Value) -> Vec<Value> {
         .map(|(i, m)| {
             let text = m[1].as_str().unwrap();
             json!({"id": format!("m{}-{}", n + 1, i + 1), "content": text, "created_at": format!("{day}T09:{i:02}:00Z"),
-                   "speaker": if m[0] == "user" { "Ana" } else { "Kai" },
+                   "speaker": m.get(2).and_then(Value::as_str).unwrap_or(if m[0] == "user" { "Ana" } else { "Kai" }),
                    "tokens": sleep_tokens(text)})
         })
         .collect()
@@ -160,9 +160,15 @@ fn served() -> (Svc, Client, String) {
     (svc, mem, base)
 }
 
-fn check_night(scenario: &Value, n: usize, night: &Value, res: &Value, svc: &Svc, start: usize) {
+fn check_night(scenario: &Value, n: usize, night: &Value, res: &Value, svc: &Svc, start: usize, reads: &[String]) {
     let where_ = format!("{} night {}", scenario["name"].as_str().unwrap(), n + 1);
     let want = &night["expect"];
+    for s in strings(&want["read_has"]) {
+        assert!(reads.iter().any(|r| r.contains(&s)), "{where_}: a reader was sent {s:?}");
+    }
+    for s in strings(&want["read_lacks"]) {
+        assert!(!reads.iter().any(|r| r.contains(&s)), "{where_}: no reader was sent {s:?}");
+    }
     let st = svc.lock().unwrap();
     let core = st.latest(0).map(|v| v.body.clone()).unwrap_or_default();
     let files: Vec<String> = st.slots.iter().flatten().map(|v| format!("{}\n{}", v.body, v.title)).collect();
@@ -270,9 +276,26 @@ async fn planted_instructions_meet_the_rules_as_the_fixture_says() {
                 settings: settings_of(&fix, scenario),
                 ..Default::default()
             };
-            let res = mem.sleep("u", model, &opts).await.unwrap_or_else(|e| panic!("{}: {e}", scenario["name"]));
-            check_night(scenario, n, night, &res, &svc, start);
+            let res = mem.sleep("u", model.clone(), &opts).await.unwrap_or_else(|e| panic!("{}: {e}", scenario["name"]));
+            let reads: Vec<String> =
+                model.calls.lock().unwrap().iter().filter(|(s, _)| s.contains(" you read part ")).map(|(_, u)| u.clone()).collect();
+            check_night(scenario, n, night, &res, &svc, start, &reads);
         }
+    }
+}
+
+#[test]
+fn the_rule_of_the_by_name_scenario_gives_the_length_each_match_needs() {
+    let fix = fix();
+    let scenarios = fix["scenarios"].as_array().unwrap();
+    let scenario = scenarios.iter().find(|s| s["name"] == "a-person-is-spoken-of-by-name-not-by-a-piece-of-one").unwrap();
+    let rule = text_of(&scenario["rule"]);
+    for says in [
+        "its name with something joined to its end when the name has two letters or more",
+        "the first three letters or more of its name",
+        "a longer topic that starts with a one-letter name",
+    ] {
+        assert!(rule.contains(says), "the rule says {says:?}: {rule}");
     }
 }
 

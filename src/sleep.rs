@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// The version of the sleep's texts, steps and rules.
-pub const SLEEP_VERSION: &str = "1.0.0";
+pub const SLEEP_VERSION: &str = "1.0.1";
 
 const SLEEP_DIGEST: &str = r#"You are the sleep of {being}. While {being} sleeps, you read part {k} of {n} of what happened
 since its last sleep. Almost all of it will be let go: every line stays in long-term memory, where a
@@ -363,7 +363,7 @@ pub struct SleepOpts {
     pub today: Option<String>,
     pub since: Option<String>,
     pub sleep_id: Option<String>,
-    /// End the store's last sleep here (default `true`).
+    /// End the store's last sleep here, unless a part went unread or the merge came back unshaped (default `true`).
     pub done: bool,
     pub line_time: SleepLineTime,
     /// Counts text for the files' sizes (default an estimate) and, when given, for the lines read.
@@ -945,11 +945,90 @@ fn sleep_parts(mems: &[Line], limit: u64) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+const SLEEP_TAGS: [&str; 10] = ["memories", "core", "boxes", "box", "proposals", "ripe", "items", "section", "tonight", "as it stood"];
+
+fn sleep_control(c: char) -> bool {
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+}
+
+fn sleep_folded(text: &str, breaks: fn(char) -> bool, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' && chars.peek() == Some(&'\n') {
+            chars.next();
+        }
+        if breaks(c) {
+            out.push_str(with);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn sleep_untagged(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, c) in text.char_indices() {
+        let tag = c == '<' && {
+            let rest = &text[i + 1..];
+            let rest = rest.strip_prefix('/').unwrap_or(rest);
+            SLEEP_TAGS.iter().any(|t| rest.starts_with(t))
+        };
+        out.push(if tag { '\u{2039}' } else { c });
+    }
+    out
+}
+
+fn sleep_shown(text: &str) -> String {
+    sleep_untagged(&sleep_folded(text, |c| matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}'), "\n    "))
+}
+
 fn sleep_lines(mems: &[Line]) -> String {
-    mems.iter().map(|m| format!("{} · {} · {} · {}", m.eid, m.at, m.who, m.text)).collect::<Vec<_>>().join("\n")
+    mems.iter()
+        .map(|m| {
+            let who = sleep_untagged(&sleep_folded(&m.who, sleep_control, " "));
+            format!("{} · {} · {who} · {}", m.eid, m.at, sleep_shown(&m.text))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sleep_heading(text: &str) -> &str {
+    strip(strip(text).trim_start_matches('#'))
+}
+
+fn sleep_heading_broken(e: &Map<String, Value>, op: &str) -> bool {
+    let mut named = vec![
+        sleep_heading(&text_or_empty(e.get("section"))).to_string(),
+        strip(&text_or_empty(e.get("title"))).to_string(),
+    ];
+    if op == "title" {
+        named.push(strip(&text_or_empty(e.get("text"))).to_string());
+    }
+    if op == "remake" {
+        named.extend(sleep_sections(strip(&text_or_empty(e.get("text")))).into_iter().map(|(h, _)| h));
+    }
+    named.iter().any(|x| x.chars().any(sleep_control))
+}
+
+fn sleep_speaks_of(topic: &str, name: &str) -> bool {
+    !topic.is_empty()
+        && !name.is_empty()
+        && (topic == name
+            || (name.chars().count() >= 2 && topic.starts_with(name))
+            || (topic.chars().count() >= 3 && name.starts_with(topic)))
 }
 
 fn fenced(t: &str) -> Option<&str> {
+    let (mut last, mut fence) = (None, false);
+    for (i, c) in t.char_indices().rev() {
+        if c == '}' && fence {
+            last = Some(i);
+            break;
+        }
+        fence = t[i..].starts_with("```") || (fence && py_space(c));
+    }
     let mut from = 0;
     while let Some(p) = t[from..].find("```") {
         let start = from + p;
@@ -959,13 +1038,7 @@ fn fenced(t: &str) -> Option<&str> {
         }
         q = t.len() - t[q..].trim_start_matches(py_space).len();
         if t[q..].starts_with('{') {
-            let close = t[q..]
-                .rmatch_indices('}')
-                .map(|(r, _)| q + r)
-                .find(|r| t[r + 1..].trim_start_matches(py_space).starts_with("```"));
-            if let Some(r) = close {
-                return Some(&t[q..=r]);
-            }
+            return last.filter(|&r| r > q).map(|r| &t[q..=r]);
         }
         from = start + 1;
     }
@@ -1042,7 +1115,7 @@ fn sleep_as_lines(text: &str) -> String {
 }
 
 fn sleep_set_section(body: &str, heading: &str, text: &str, raw: bool) -> String {
-    let heading = strip(strip(heading).trim_start_matches('#')).to_string();
+    let heading = sleep_heading(heading).to_string();
     let text = if raw { sleep_demote(strip(text)) } else { sleep_as_lines(text) };
     let mut secs = sleep_sections(body);
     match secs.iter_mut().find(|(h, _)| *h == heading) {
@@ -1115,12 +1188,16 @@ pub(crate) fn sleep_render(view: &SleepView, today: i64) -> String {
 
 pub(crate) fn sleep_box_pick(view: &SleepView, which: &str) -> Option<usize> {
     let which = strip(which);
-    SLEEP_BOXES.into_iter().find(|&s| {
-        let title = &view[s].title;
-        which == s.to_string()
-            || which == title
-            || (!title.is_empty() && title.to_lowercase().contains(&which.to_lowercase()))
-    })
+    if which.is_empty() {
+        return None;
+    }
+    let lower = which.to_lowercase();
+    let title = |s: usize| view[s].title.as_str();
+    SLEEP_BOXES
+        .into_iter()
+        .find(|&s| which == s.to_string() || which == title(s))
+        .or_else(|| SLEEP_BOXES.into_iter().find(|&s| !title(s).is_empty() && title(s).to_lowercase() == lower))
+        .or_else(|| SLEEP_BOXES.into_iter().find(|&s| !title(s).is_empty() && title(s).to_lowercase().contains(&lower)))
 }
 
 pub(crate) fn sleep_box_text(s: usize, f: &SleepFile, today: i64) -> String {
@@ -1173,24 +1250,64 @@ fn sleep_notes_of(r: &Value) -> (i64, Map<String, Value>) {
             notes.insert(k.into(), json!([]));
         }
     }
-    let readable = |p: &Value| {
-        p.as_object().is_some_and(|o| ["id", "text", "first_day"].iter().all(|k| o.contains_key(*k)))
-            && whole(p.get("sleeps")).is_some_and(|n| n >= 1)
-            && p.get("first").and_then(Value::as_f64).is_some()
-    };
     let kept: Vec<Value> = notes["proposals"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|&p| readable(p))
         .map(|p| {
             let mut p = p.clone();
-            p["sleeps"] = json!(whole(p.get("sleeps")));
+            if sleep_readable(&p) {
+                p["sleeps"] = json!(whole(p.get("sleeps")));
+            }
             p
         })
         .collect();
     notes.insert("proposals".into(), Value::Array(kept));
     (whole(v).filter(|n| *n >= 0).unwrap_or(0), notes)
+}
+
+fn sleep_readable(p: &Value) -> bool {
+    p.as_object().is_some_and(|o| ["id", "text", "first_day"].iter().all(|k| o.contains_key(*k)))
+        && whole(p.get("sleeps")).is_some_and(|n| n >= 1)
+        && p.get("first").and_then(Value::as_f64).is_some()
+}
+
+const SLEEP_NOTES_CAP: u64 = 200_000;
+
+fn sleep_next_id(entries: &[Value]) -> String {
+    let top = entries
+        .iter()
+        .filter_map(|p| p.get("id").and_then(Value::as_str)?.strip_prefix('p').map(str::to_string))
+        .filter(|d| (1..=9).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|d| d.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+    format!("p{}", top + 1)
+}
+
+fn sleep_size(v: &Value) -> u64 {
+    match v {
+        Value::String(s) => s.len() as u64 + 2,
+        Value::Array(a) => 2 + a.iter().map(|x| sleep_size(x) + 1).sum::<u64>(),
+        Value::Object(o) => 2 + o.iter().map(|(k, x)| k.len() as u64 + 2 + sleep_size(x) + 2).sum::<u64>(),
+        _ => 8,
+    }
+}
+
+fn sleep_notes_fit(notes: &mut Map<String, Value>) {
+    let mut size = sleep_size(&Value::Object(notes.clone()));
+    for key in ["proposals", "mixed"] {
+        let all = notes.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut keep = Vec::new();
+        for x in all {
+            if size > SLEEP_NOTES_CAP && (key == "mixed" || (sleep_readable(&x) && truthy(x.get("applied")))) {
+                size -= sleep_size(&x) + 1;
+            } else {
+                keep.push(x);
+            }
+        }
+        notes.insert(key.into(), Value::Array(keep));
+    }
 }
 
 fn sleep_written(r: &Value, writes: &[Value]) -> std::collections::BTreeMap<i64, i64> {
@@ -1450,6 +1567,7 @@ fn sleep_mark_key(x: &Value) -> String {
 fn sleep_checked_mixed(got: Option<&Map<String, Value>>, part: &[Line]) -> (Vec<Value>, usize) {
     let pos = |e: &str| part.iter().position(|m| m.eid == e);
     let (mut mixed, mut dropped) = (Vec::new(), 0);
+    let mut keys: std::collections::HashSet<(usize, String, Option<usize>)> = Default::default();
     for x in listed(got.and_then(|g| g.get("mixed"))) {
         let line = if x.is_object() { text_of(x.get("line").unwrap_or(&Value::Null)) } else { String::new() };
         let kind = x.get("kind").and_then(Value::as_str).filter(|k| SLEEP_MIX_KINDS.contains(k));
@@ -1463,6 +1581,7 @@ fn sleep_checked_mixed(got: Option<&Map<String, Value>>, part: &[Line]) -> (Vec<
         let from_me = src.is_some_and(|s| part[s].mine);
         if (kind == "echo" && (mine || (src.is_some() && !from_me)))
             || (kind == "planted" && (!mine || (src.is_some() && !from_me)))
+            || !keys.insert((at, kind.to_string(), src))
         {
             dropped += 1;
             continue;
@@ -1546,6 +1665,7 @@ struct Asker {
     caller: Arc<dyn ModelCaller>,
     model: String,
     max_tokens: u32,
+    call_time: std::time::Duration,
 }
 
 impl Asker {
@@ -1562,9 +1682,14 @@ impl Asker {
                 effort: None,
                 schema: None,
                 system_tokens: None,
-                deadline: t0 + SLEEP_CALL_TIME,
+                deadline: t0 + self.call_time,
             };
-            match self.caller.call(&c).await {
+            let raced = tokio::time::timeout(self.call_time, self.caller.call(&c)).await.unwrap_or_else(|_| {
+                let secs = self.call_time.as_secs_f64();
+                let shown = if secs.fract() == 0.0 { format!("{}", secs as u64) } else { format!("{secs}") };
+                Err(ModelCallError::timeout(format!("the sleep's model call ran past {shown} s")))
+            });
+            match raced {
                 Ok(reply) => {
                     let reply = reply_shape(reply);
                     let u = reply.usage.as_ref().and_then(Value::as_object).cloned().unwrap_or_default();
@@ -1810,10 +1935,24 @@ type Files = [Held; 5];
 struct Ledger {
     refused: Vec<Value>,
     rooms: Vec<Value>,
+    carried: Vec<(usize, usize, String, String)>,
+}
+
+fn sleep_put_back(new: &mut Files, files: &Files, k: usize, carried: &[(usize, usize, String, String)]) {
+    new[k] = files[k].clone();
+    for (src, dst, sec, text) in carried {
+        if *dst == k && [*src, k].iter().all(|j| section_of(&new[*j].body, sec).is_none()) {
+            new[*src].body = sleep_set_section(&new[*src].body, sec, text, true);
+        }
+    }
 }
 
 fn sleep_where(new: &Files, k: usize) -> String {
     if k == 0 { "core".into() } else { format!("box \"{}\"", new[k].title) }
+}
+
+fn sleep_cap(s: &SleepSettings, k: usize) -> u64 {
+    if k == 0 { s.core_tokens } else { s.box_tokens }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1847,13 +1986,17 @@ async fn sleep_room(
     let text = text_or_empty(g.get("text"));
     let mut body = strip(&text).to_string();
     body = if body.starts_with("## ") { sleep_join(&sleep_sections(&body)) } else { String::new() };
+    let had = new[0].body.clone();
+    let mut moves: Vec<(usize, String, String)> = Vec::new();
     if k == 0 && !body.is_empty() {
-        match section_of(&new[0].body, SLEEP_ME) {
-            None => body = sleep_drop_section(&body, SLEEP_ME).0,
-            Some(mine) => {
-                if section_of(&body, SLEEP_ME).as_ref() != Some(&mine) {
-                    body = sleep_set_section(&body, SLEEP_ME, &mine, true);
-                }
+        let kept: Vec<(String, String)> =
+            sleep_sections(&body).into_iter().filter(|(h, _)| section_of(&had, h).is_some()).collect();
+        body = sleep_join(&kept);
+    }
+    if k == 0 && !body.is_empty() {
+        if let Some(mine) = section_of(&had, SLEEP_ME) {
+            if section_of(&body, SLEEP_ME).as_ref() != Some(&mine) {
+                body = sleep_set_section(&body, SLEEP_ME, &mine, true);
             }
         }
         for mv in listed(g.get("moved")) {
@@ -1862,17 +2005,25 @@ async fn sleep_room(
                 continue;
             }
             let sec = strip(&text_or_empty(mv.get("section"))).to_string();
-            if let Some(held) = section_of(&new[0].body, &sec) {
-                if sec != SLEEP_ME && section_of(&body, &sec).is_none() {
-                    let to: usize = to.parse().unwrap_or(1);
-                    new[to].body = sleep_set_section(&new[to].body, &sec, &held, false);
+            if let Some(held) = section_of(&had, &sec) {
+                if sec != SLEEP_ME && section_of(&body, &sec).is_none() && !moves.iter().any(|(_, s, _)| *s == sec) {
+                    moves.push((to.parse().unwrap_or(1), sec, held));
                 }
             }
         }
     }
-    if !body.is_empty() && count.of(&body) <= cap {
+    let mut boxes: std::collections::BTreeMap<usize, String> = Default::default();
+    for (to, sec, held) in &moves {
+        let from = boxes.get(to).cloned().unwrap_or_else(|| new[*to].body.clone());
+        boxes.insert(*to, sleep_set_section(&from, sec, held, false));
+    }
+    if !body.is_empty() && count.of(&body) <= cap && boxes.values().all(|b| count.of(b) <= n.run.s.box_tokens) {
         ledger.rooms.push(json!({"file": k, "before": used_now, "after": count.of(&body)}));
         new[k].body = body;
+        for (to, b) in boxes {
+            new[to].body = b;
+        }
+        ledger.carried.extend(moves.into_iter().map(|(to, sec, held)| (k, to, sec, held)));
     } else {
         ledger.rooms.push(json!({"file": k, "before": used_now, "after": null}));
         let why = why.map_or_else(
@@ -1886,7 +2037,7 @@ async fn sleep_room(
             str::to_string,
         );
         ledger.refused.push(json!({"edit": {"file": k, "op": "room"}, "why": why}));
-        new[k] = files[k].clone();
+        sleep_put_back(new, files, k, &ledger.carried);
     }
     Ok(())
 }
@@ -1895,7 +2046,7 @@ fn sleep_boxes_fit(n: &Night<'_>, new: &mut Files, files: &Files, ledger: &mut L
     for k in SLEEP_BOXES {
         if n.run.count.of(&new[k].body) > n.run.s.box_tokens {
             ledger.refused.push(json!({"edit": {"file": k, "op": "room"}, "why": "over its cap after a move; the box stays as it was"}));
-            new[k] = files[k].clone();
+            sleep_put_back(new, files, k, &ledger.carried);
         }
     }
 }
@@ -1953,6 +2104,21 @@ fn sleep_no_room(message: &str) -> Option<(i64, i64, i64)> {
     })
 }
 
+fn sleep_dedupe(new: &mut Files, deduped: &mut Vec<Value>, carried: &mut Vec<(usize, usize, String, String)>) {
+    let in_core: Vec<String> = sleep_sections(&new[0].body).into_iter().map(|(h, _)| h).filter(|h| h != SLEEP_ME).collect();
+    for k in SLEEP_BOXES {
+        for (h, _) in sleep_sections(&new[k].body) {
+            if in_core.contains(&h) {
+                let (body, gone) = sleep_drop_section(&new[k].body, &h);
+                new[k].body = body;
+                deduped.push(json!({"file": k, "section": h}));
+                carried.push((k, 0, h, gone.unwrap_or_default()));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn sleep_write_files(
     n: &Night<'_>,
     sleep_id: &str,
@@ -1961,10 +2127,12 @@ async fn sleep_write_files(
     ev: &[String],
     day: &str,
     ledger: &mut Ledger,
+    deduped: &mut Vec<Value>,
 ) -> Result<std::collections::BTreeMap<i64, i64>, SleepError> {
     let s = n.run.s;
     let mut made_room: Vec<usize> = Vec::new();
     loop {
+        sleep_dedupe(new, deduped, &mut ledger.carried);
         let writes: Vec<Value> = SLEEP_SLOTS
             .into_iter()
             .filter(|&k| new[k].body != files[k].body || new[k].title != files[k].title)
@@ -2002,13 +2170,12 @@ async fn sleep_write_files(
         }
         let slots: Vec<i64> = writes.iter().map(|w| w["slot"].as_i64().unwrap_or(0)).collect();
         let named = int_of(d.get("slot"));
-        let cap_of = |slot: i64| if slot == 0 { s.core_tokens } else { s.box_tokens };
         let k = match named.filter(|x| slots.contains(x)) {
             Some(x) => x,
             None => {
                 let fill = |w: &Value| {
                     let slot = w["slot"].as_i64().unwrap_or(0);
-                    n.run.count.of(w["body"].as_str().unwrap_or("")) as f64 / cap_of(slot) as f64
+                    n.run.count.of(w["body"].as_str().unwrap_or("")) as f64 / sleep_cap(&s, slot as usize) as f64
                 };
                 let mut best = &writes[0];
                 for w in &writes[1..] {
@@ -2020,11 +2187,11 @@ async fn sleep_write_files(
             }
         };
         let ku = k as usize;
-        let cap = cap_of(k);
+        let cap = sleep_cap(&s, ku);
         if made_room.contains(&ku) {
             ledger.refused.push(json!({"edit": {"file": k, "op": "room"},
                                        "why": "no room: the service counts it over its cap; the file stays as it was"}));
-            new[ku] = files[ku].clone();
+            sleep_put_back(new, files, ku, &ledger.carried);
             continue;
         }
         made_room.push(ku);
@@ -2051,6 +2218,14 @@ async fn sleep_done_flow(n: &Night<'_>, sleep_id: &str) -> Result<Value, WosErro
         return Ok(Value::Null);
     }
     n.run.client.post_idem("/api/v1/memory/sleep/done", json!({"user_id": n.run.store, "sleep_id": sleep_id}), None).await
+}
+
+fn sleep_titles<'a>(title: impl Fn(usize) -> &'a String) -> String {
+    SLEEP_BOXES
+        .iter()
+        .map(|&k| format!("{k}: {}", if title(k).is_empty() { "(empty)" } else { title(k) }))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn field(p: &Value, key: &str) -> String {
@@ -2109,12 +2284,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
     let seeded = if n.prompt.is_empty() { false } else { sleep_seed(n, &mut files, &sid, &day).await? };
     let (mems, many) = sleep_memories(&rows, being, &assistant, n.line_time, count);
     let core = files[0].body.clone();
-    let titles = SLEEP_BOXES
-        .iter()
-        .map(|&k| format!("{k}: {}", if files[k].title.is_empty() { "(empty)" } else { &files[k].title }))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut proposals: Vec<Value> = notes["proposals"].as_array().cloned().unwrap_or_default();
+    let titles = sleep_titles(|k| &files[k].title);
+    let held: Vec<Value> = notes["proposals"].as_array().cloned().unwrap_or_default();
+    let mut proposals: Vec<Value> = held.iter().filter(|p| sleep_readable(p)).cloned().collect();
     let read_tokens = token_sum(&mems);
     n.say(&format!(
         "{} memories, {} tokens → {} readers ({} at a time)",
@@ -2202,6 +2374,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
     let (mut applied, mut used, mut merge_notes) = (Vec::new(), std::collections::BTreeSet::new(), Vec::new());
     let (mut folds, mut settled, mut deduped, mut tidied) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut touched: std::collections::BTreeSet<(usize, String)> = Default::default();
+    let mut unmerged = false;
     if !items.is_empty() || !ripe.is_empty() {
         let blocks = SLEEP_BOXES
             .iter()
@@ -2257,6 +2430,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
         if got.is_none() {
             got = n.merge.ask_json_logged(&system, &format!("{user}{SLEEP_SHORTER}"), "merge shorter", log).await?;
         }
+        unmerged = got.is_none();
         let got = got.unwrap_or_default();
         if let Some(Value::Array(a)) = got.get("notes") {
             merge_notes = a.iter().map(text_of).collect();
@@ -2271,7 +2445,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 _ => None,
             }
         };
-        let ripe_ids: Vec<Value> = ripe.iter().map(|p| p.get("id").cloned().unwrap_or(Value::Null)).collect();
+        let ripe_ids: Vec<Value> = ripe.iter().filter_map(|p| p.get("id").filter(|id| id.is_string()).cloned()).collect();
         let is_ripe_id = |v: Option<&Value>| ripe_ids.iter().any(|id| same(id, v.unwrap_or(&Value::Null)));
         let tonight: Vec<String> = items
             .iter()
@@ -2280,9 +2454,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             .collect();
         let about_tonight = |name: &str| {
             let nm = strip(name).to_lowercase();
-            tonight.iter().any(|t| !nm.is_empty() && !t.is_empty() && (t.contains(&nm) || nm.contains(t.as_str())))
+            tonight.iter().any(|t| sleep_speaks_of(t, &nm))
         };
-        let section_name = |v: Option<&Value>| strip(strip(&text_or_empty(v)).trim_start_matches('#')).to_string();
+        let section_name = |v: Option<&Value>| sleep_heading(&text_or_empty(v)).to_string();
         let edits = match got.get("edits") {
             Some(Value::Array(a)) => a.clone(),
             _ => Vec::new(),
@@ -2294,7 +2468,11 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             let slot = slot_of(eo.get("file"));
             let ev = sleep_eids(eo.get("evidence"));
             let ops = ["rewrite", "remake", "move_section", "title"];
+            let mut made_ripe: Option<Value> = None;
             match slot {
+                _ if sleep_heading_broken(eo, op) => {
+                    why = Some("a heading or a title holds a line break or a control character".into())
+                }
                 None => why = Some("unknown file or op".into()),
                 Some(_) if !ops.contains(&op) || !eo.get("op").is_some_and(Value::is_string) => {
                     why = Some("unknown file or op".into())
@@ -2308,6 +2486,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 }
                 Some(slot) if op == "rewrite" => {
                     let sec = section_name(eo.get("section"));
+                    let sec = if slot == 0 && sec.to_lowercase() == me.to_lowercase() { me.to_string() } else { sec };
                     if sec.is_empty() || strip(&text_or_empty(eo.get("text"))).is_empty() {
                         why = Some("rewrite needs a section and text".into());
                     } else if slot == 0 && sec == me && !is_ripe_id(eo.get("ripe")) {
@@ -2331,6 +2510,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                                 let raw = slot == 0 && sec == me;
                                 new[slot].body = sleep_set_section(&new[slot].body, &sec, &text, raw);
                                 touched.insert((slot, sec));
+                                if raw {
+                                    made_ripe = eo.get("ripe").cloned();
+                                }
                             }
                         }
                     }
@@ -2357,13 +2539,14 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                     let to = slot_of(eo.get("to"));
                     let sec = section_name(eo.get("section"));
                     match to {
-                        Some(to) if to != slot && !((slot == 0 || to == 0) && sec == me) => {
+                        Some(to) if to != slot && !((slot == 0 || to == 0) && sec.to_lowercase() == me.to_lowercase()) => {
                             let (body, text) = sleep_drop_section(&new[slot].body, &sec);
                             match text {
                                 None => why = Some("no such section".into()),
                                 Some(text) => {
                                     new[slot].body = body;
                                     new[to].body = sleep_set_section(&new[to].body, &sec, &text, false);
+                                    ledger.carried.push((slot, to, sec.clone(), text));
                                 }
                             }
                         }
@@ -2384,9 +2567,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             match why {
                 Some(why) => ledger.refused.push(json!({"edit": e, "why": why})),
                 None => {
-                    if truthy(eo.get("ripe")) {
+                    if let Some(ripe_id) = &made_ripe {
                         for p in proposals.iter_mut() {
-                            if same(p.get("id").unwrap_or(&Value::Null), &eo["ripe"]) {
+                            if same(p.get("id").unwrap_or(&Value::Null), ripe_id) {
                                 if let Some(p) = p.as_object_mut() {
                                     p.insert("applied".into(), json!(today));
                                 }
@@ -2398,15 +2581,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 }
             }
         }
-        let in_core: Vec<String> = sleep_sections(&new[0].body).into_iter().map(|(h, _)| h).filter(|h| h != me).collect();
-        for k in SLEEP_BOXES {
-            for (h, _) in sleep_sections(&new[k].body) {
-                if in_core.contains(&h) {
-                    new[k].body = sleep_drop_section(&new[k].body, &h).0;
-                    deduped.push(json!({"file": k, "section": h}));
-                }
-            }
-        }
+        sleep_dedupe(&mut new, &mut deduped, &mut ledger.carried);
         for (k, h) in &touched {
             let k = *k;
             let Some(t) = section_of(&new[k].body, h).filter(|t| !t.is_empty()) else { continue };
@@ -2473,7 +2648,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             }
         }
         for k in SLEEP_SLOTS {
-            let cap = if k == 0 { s.core_tokens } else { s.box_tokens };
+            let cap = sleep_cap(&s, k);
             let used_now = count.of(&new[k].body);
             if used_now <= cap {
                 continue;
@@ -2499,7 +2674,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             let same_as = p.get("same_as").unwrap_or(&Value::Null);
             let found = proposals
                 .iter()
-                .position(|q| same(q.get("id").unwrap_or(&Value::Null), same_as))
+                .position(|q| q.get("id").is_some_and(|id| id.is_string() && id == same_as))
                 .or_else(|| proposals.iter().position(|q| counted_here(q) && q.get("text") == Some(&json!(text))));
             match found {
                 Some(i) => {
@@ -2524,7 +2699,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                     }
                 }
                 None => {
-                    let pid = format!("p{}", proposals.len() + 1);
+                    let pid = sleep_next_id(&[held.as_slice(), proposals.as_slice()].concat());
                     proposals.push(json!({"id": pid, "text": text, "sleeps": 1, "first": now,
                                           "first_day": today, "last_day": today, "span_end": span_end}));
                     seen_now.push(json!(pid));
@@ -2532,10 +2707,15 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             }
         }
     }
-    notes.insert("proposals".into(), Value::Array(proposals.clone()));
+    let mut worked = proposals.iter();
+    let mut kept: Vec<Value> =
+        held.iter().map(|p| if sleep_readable(p) { worked.next().cloned().unwrap_or(Value::Null) } else { p.clone() }).collect();
+    kept.extend(worked.cloned());
+    notes.insert("proposals".into(), Value::Array(kept));
+    sleep_notes_fit(&mut notes);
     let ev: Vec<String> =
         used.iter().filter_map(|e: &String| by_eid.get(e.as_str()).map(|m| m.mid.clone())).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    let written = sleep_write_files(n, &sid, &files, &mut new, &ev, &day, &mut ledger).await?;
+    let written = sleep_write_files(n, &sid, &files, &mut new, &ev, &day, &mut ledger, &mut deduped).await?;
     if notes != before {
         client
             .post_idem(
@@ -2545,7 +2725,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             )
             .await?;
     }
-    let ended = sleep_done_flow(n, &sid).await?;
+    let ended = if unread.is_empty() && !unmerged { sleep_done_flow(n, &sid).await? } else { Value::Null };
     let secs = round_to(t0.elapsed().as_secs_f64(), 1);
     let slots: Vec<String> = written.keys().map(i64::to_string).collect();
     n.say(&format!(
@@ -2590,11 +2770,7 @@ async fn sleep_estimate_flow(run: &Run<'_>, prices: Option<(f64, f64)>) -> Resul
     let (mems, _) = sleep_memories(&rows, &run.being, "", SleepLineTime::CreatedAt, &run.count);
     let parts = sleep_parts(&mems, run.s.part_tokens);
     let tokens = token_sum(&mems);
-    let titles = SLEEP_BOXES
-        .iter()
-        .map(|&k| format!("{k}: {}", if view[k].title.is_empty() { "(empty)" } else { &view[k].title }))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let titles = sleep_titles(|k| &view[k].title);
     let core = view[0].body.as_deref().unwrap_or("");
     let frame = [SLEEP_DIGEST, core, titles.as_str()].into_iter().fold(0, |n: u64, t| n.saturating_add(run.count.of(t)));
     let sent = (u128::from(tokens) + parts.len() as u128 * u128::from(frame)) * u128::from(SLEEP_IN_PER_100);
@@ -2617,7 +2793,7 @@ fn sleep_asker(client: &Client, caller: &Arc<dyn ModelCaller>, what: &str, max_t
         provider_base(base, Some(&client.base_url))?;
     }
     let model = super::check_model_name(caller.model().unwrap_or(SLEEP_MODEL), &format!("{what}.model"))?;
-    Ok(Asker { caller: caller.clone(), model, max_tokens })
+    Ok(Asker { caller: caller.clone(), model, max_tokens, call_time: SLEEP_CALL_TIME })
 }
 
 fn required(v: &str, name: &str) -> Result<String, WosError> {
@@ -2667,7 +2843,7 @@ pub(crate) async fn sleep(
                 && rest[0] == ' '
                 && rest[3] == ':'
                 && [1, 2, 4, 5].iter().all(|i| digit(rest[*i]).is_some()));
-        if sleep_date(&day).is_none() || !clock {
+        if sleep_date(&day).is_none() || !clock || sleep_when(today).is_none() {
             return Err(refused(format!(
                 "today must be \"YYYY-MM-DD HH:MM\" or \"YYYY-MM-DD\", the sleep's day, got {}.",
                 serde_json::to_string(today).unwrap_or_default()
@@ -2679,7 +2855,7 @@ pub(crate) async fn sleep(
     let tokens = check_whole(u64::from(opts.max_tokens), "max_tokens", 1, u64::from(MODEL_MAX_TOKENS))? as u32;
     let read = sleep_asker(client, &llm, "llm", tokens)?;
     let merge = match &opts.merge_llm {
-        None => Asker { caller: read.caller.clone(), model: read.model.clone(), max_tokens: tokens },
+        None => Asker { caller: read.caller.clone(), model: read.model.clone(), max_tokens: tokens, call_time: read.call_time },
         Some(m) => sleep_asker(client, m, "merge_llm", tokens)?,
     };
     let night = Night {
@@ -3503,7 +3679,7 @@ mod tests {
         );
         assert_eq!((SLEEP_PAGE_TOKENS, SLEEP_LINE_FRAME, SLEEP_MAX_TOKENS), (20_000, 12, 16_000));
         assert_eq!((SLEEP_IN_PER_100, SLEEP_OUT_PER_100, SLEEP_MARGIN, SLEEP_ESTIMATE_PRICES), (172, 7, 0.15, (2.0, 10.0)));
-        assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.0", "1.0.0"));
+        assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.1", "1.0.1"));
         let o = SleepOpts::default();
         assert_eq!((o.being.as_str(), o.prompt.as_str(), o.done, o.max_tokens), ("the assistant", "", true, 16_000));
         assert_eq!((o.line_time, o.settings), (SleepLineTime::CreatedAt, s));
@@ -4317,7 +4493,7 @@ mod tests {
         let frame = sleep_tokens(SLEEP_DIGEST) + sleep_tokens("") + sleep_tokens("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)");
         let (sent, written) = (((tokens + frame) * 172).div_ceil(100), (tokens * 7).div_ceil(100));
         let basis = |prices: [f64; 2]| {
-            json!({"sleep_version": "1.0.0", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
+            json!({"sleep_version": "1.0.1", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
                    "margin": 0.15, "prices": prices})
         };
         let cost = round_to((sent as f64 * 1.0 + written as f64 * 5.0) * 1.15 / 1_000_000.0, 6);
@@ -4600,11 +4776,11 @@ mod tests {
         let mem = scroll2(&mem);
         for ((speakers, dates, images), want) in TOOLS_TODAY {
             let on = |t: crate::MemoryTools| t.with_speakers(speakers).with_dates(dates).with_images(images);
-            assert_eq!(tools_digest(&on(mem.memory_tools("u", None).unwrap())), want, "{speakers} {dates} {images}");
-            assert_eq!(tools_digest(&on(mem.memory_tools("u", None).unwrap().with_sleep(false))), want);
-            assert_eq!(tools_digest(&on(mem.memory_tools("u", None).unwrap().with_sleep(true).with_sleep(false))), want);
+            assert_eq!(tools_digest(&on(mem.memory_tools_preset("u", None, "S-2").unwrap())), want, "{speakers} {dates} {images}");
+            assert_eq!(tools_digest(&on(mem.memory_tools_preset("u", None, "S-2").unwrap().with_sleep(false))), want);
+            assert_eq!(tools_digest(&on(mem.memory_tools_preset("u", None, "S-2").unwrap().with_sleep(true).with_sleep(false))), want);
         }
-        let tools = mem.memory_tools("u", None).unwrap();
+        let tools = mem.memory_tools_preset("u", None, "S-2").unwrap();
         let names: Vec<String> = tools.definitions(ToolFormat::Anthropic).iter().map(|d| d["name"].as_str().unwrap().to_string()).collect();
         assert!(!names.contains(&"open_box".to_string()));
         let e = tools.run("open_box", &json!({"box": "1"})).await.unwrap_err().to_string();
@@ -4614,12 +4790,24 @@ mod tests {
         assert_eq!(paths(&svc), ["work/open"]);
     }
 
+    const USAGE_ON: &str = "3369ca49bce3f9085260d9e0b88cf61d115d6a3e6986f10a932ecb98856877cc";
+
+    #[test]
+    fn memory_tools_with_usage_are_pinned_and_without_it_are_the_tools_to_the_byte() {
+        let mem = Client::with_base_url(KEY, "http://127.0.0.1:9").with_model("scroll-2");
+        for ((speakers, dates, images), want) in TOOLS_TODAY {
+            let t = mem.memory_tools_preset("u", None, "S-2").unwrap().with_speakers(speakers).with_dates(dates).with_images(images);
+            assert_eq!(tools_digest(&t.with_usage(false)), want, "{speakers} {dates} {images}");
+        }
+        assert_eq!(tools_digest(&mem.memory_tools_preset("u", None, "S-2").unwrap().with_usage(true)), USAGE_ON);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn memory_tools_with_sleep_carry_the_core_the_boxes_and_the_reader_note() {
         let (svc, mem) = new_with(files_service());
         let mem = scroll2(&mem);
-        let tools = mem.memory_tools("u", None).unwrap().with_sleep(true).with_today("2026-10-05").unwrap();
-        let base = mem.memory_tools("u", None).unwrap().note();
+        let tools = mem.memory_tools_preset("u", None, "S-2").unwrap().with_sleep(true).with_today("2026-10-05").unwrap();
+        let base = mem.memory_tools_preset("u", None, "S-2").unwrap().note();
         assert_eq!(tools.note(), base, "before the files are read, the note without them");
         assert!(paths(&svc).is_empty(), "the note reads nothing");
         tools.load().await.unwrap();
@@ -4642,7 +4830,7 @@ mod tests {
         assert_eq!(tools.note(), format!("{base}\n\n{SLEEP_READER_NOTE}\n{files}"));
         assert_eq!(paths(&svc), ["self"]);
         let defs = tools.definitions(ToolFormat::Anthropic);
-        assert_eq!(defs[..defs.len() - 1], mem.memory_tools("u", None).unwrap().definitions(ToolFormat::Anthropic)[..]);
+        assert_eq!(defs[..defs.len() - 1], mem.memory_tools_preset("u", None, "S-2").unwrap().definitions(ToolFormat::Anthropic)[..]);
         assert_eq!(defs[defs.len() - 1], open_box_tool());
         let b = open_box_tool();
         assert_eq!(
@@ -4683,20 +4871,22 @@ mod tests {
     async fn memory_tools_with_sleep_read_the_files_at_the_first_turn_and_date_them_on_the_clock() {
         let (svc, mem) = new_with(files_service());
         let mem = scroll2(&mem).with_tz(-12.0).unwrap();
-        let tools = mem.memory_tools("u", None).unwrap().with_sleep(true);
+        let tools = mem.memory_tools_preset("u", None, "S-2").unwrap().with_sleep(true);
         tools.begin("q").await.unwrap();
         assert_eq!(paths(&svc), ["self", "work/open"]);
         assert!(tools.note().contains("<core last edited 2026-10-01, "));
         let day = today_on(Some(-12.0));
         let want = format!("{} days ago", day - sleep_date("2026-10-01").unwrap());
         assert!(tools.note().contains(&want) || (day == sleep_date("2026-10-01").unwrap() && tools.note().contains("today")));
-        let e = mem.memory_tools("u", None).unwrap().with_sleep(true).with_today("2026-13-01").unwrap_err().to_string();
+        let e = mem.memory_tools_preset("u", None, "S-2").unwrap().with_sleep(true).with_today("2026-13-01").unwrap_err().to_string();
         assert!(e.contains("today must be a day"), "{e}");
-        let e = mem.memory_tools("u", None).unwrap().with_today("2026-10-01").unwrap_err().to_string();
+        let e = mem.memory_tools_preset("u", None, "S-2").unwrap().with_today("2026-10-01").unwrap_err().to_string();
         assert!(e.contains("it goes with with_sleep(true)"), "{e}");
-        let plain = mem.memory_tools("u", None).unwrap();
+        let plain = mem.memory_tools_preset("u", None, "S-2").unwrap();
         assert!(plain.load().await.unwrap_err().to_string().contains("make the tools with with_sleep(true)"));
     }
 
     mod attacks;
+    mod held;
+    mod hunt;
 }

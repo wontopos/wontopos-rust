@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "wontopos"
-version = "2.2.49"
+version = "2.2.50"
 dependencies = [
  "chrono",
  "chrono-tz",
