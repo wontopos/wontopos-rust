@@ -1,6 +1,6 @@
 [package]
 name = "wontopos"
-version = "2.2.50"
+version = "2.2.51"
 edition = "2021"
 rust-version = "1.83"
 license = "MIT OR Apache-2.0"

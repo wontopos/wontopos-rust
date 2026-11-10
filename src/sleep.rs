@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// The version of the sleep's texts, steps and rules.
-pub const SLEEP_VERSION: &str = "1.0.1";
+pub const SLEEP_VERSION: &str = "1.0.2";
 
 const SLEEP_DIGEST: &str = r#"You are the sleep of {being}. While {being} sleeps, you read part {k} of {n} of what happened
 since its last sleep. Almost all of it will be let go: every line stays in long-term memory, where a
@@ -877,6 +877,15 @@ pub(crate) fn today_on(tz: Option<f64>) -> i64 {
     ms.div_euclid(86_400_000)
 }
 
+fn sleep_who(speaker: &str, being: &str) -> String {
+    let low = speaker.to_lowercase();
+    if low == crate::js_trim(being).to_lowercase() || low == "user" || speaker.contains(" \u{b7} ") {
+        format!("\"{speaker}\"")
+    } else {
+        speaker.to_string()
+    }
+}
+
 fn sleep_memories(rows: &[Value], being: &str, assistant: &str, line_time: SleepLineTime, count: &Count) -> (Vec<Line>, bool) {
     let when = |v: Option<&Value>| v.and_then(Value::as_str).and_then(sleep_when);
     let speaker_of = |r: &Value| r.get("speaker").and_then(Value::as_str).map(crate::js_trim).unwrap_or("").to_string();
@@ -893,7 +902,7 @@ fn sleep_memories(rows: &[Value], being: &str, assistant: &str, line_time: Sleep
             let (at, ts) = when(event.or(said)).or_else(|| when(said)).unwrap_or(("1970-01-01 00:00".into(), 0.0));
             let speaker = speaker_of(r);
             let mine = !speaker.is_empty() && (speaker == assistant || speaker == "me");
-            let who = if mine { being } else if many && !speaker.is_empty() { &speaker } else { "user" };
+            let who = if mine { being.to_string() } else if many && !speaker.is_empty() { sleep_who(&speaker, being) } else { "user".to_string() };
             let size = match (&count.0, whole(r.get("tokens"))) {
                 (Some(f), _) => f(&text),
                 (None, Some(n)) if n >= 0 => n as u64,
@@ -903,7 +912,7 @@ fn sleep_memories(rows: &[Value], being: &str, assistant: &str, line_time: Sleep
                 eid: format!("e{}", i + 1),
                 mid: r.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
                 at,
-                who: who.to_string(),
+                who,
                 mine,
                 text,
                 tokens: size.saturating_add(SLEEP_LINE_FRAME),
@@ -973,7 +982,7 @@ fn sleep_untagged(text: &str) -> String {
         let tag = c == '<' && {
             let rest = &text[i + 1..];
             let rest = rest.strip_prefix('/').unwrap_or(rest);
-            SLEEP_TAGS.iter().any(|t| rest.starts_with(t))
+            SLEEP_TAGS.iter().any(|t| rest.as_bytes().get(..t.len()).is_some_and(|head| head.eq_ignore_ascii_case(t.as_bytes())))
         };
         out.push(if tag { '\u{2039}' } else { c });
     }
@@ -981,7 +990,30 @@ fn sleep_untagged(text: &str) -> String {
 }
 
 fn sleep_shown(text: &str) -> String {
-    sleep_untagged(&sleep_folded(text, |c| matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}'), "\n    "))
+    let breaks = |c| matches!(c, '\r' | '\n' | '\u{b}' | '\u{c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}');
+    sleep_untagged(&sleep_folded(text, breaks, "\n    "))
+}
+
+fn sleep_kept(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let rare = match c {
+            '\r' => chars.peek() != Some(&'\n'),
+            '\u{b}' | '\u{c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}' => true,
+            _ => false,
+        };
+        if rare {
+            out.push_str("\n    ");
+        } else {
+            out.push(c);
+        }
+    }
+    sleep_untagged(&out)
+}
+
+fn sleep_named(text: &str) -> String {
+    sleep_untagged(&sleep_folded(text, sleep_control, " "))
 }
 
 fn sleep_lines(mems: &[Line]) -> String {
@@ -1086,6 +1118,21 @@ fn sleep_sections(body: &str) -> Vec<(String, String)> {
     out.into_iter().map(|(h, b)| (h, strip(&b.join("\n")).to_string())).collect()
 }
 
+fn sleep_core(body: &str) -> String {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let first = lines.iter().position(|ln| ln.starts_with("## ")).unwrap_or(lines.len());
+    let lead = strip(&lines[..first].join("\n")).to_string();
+    if lead.is_empty() {
+        return body.to_string();
+    }
+    let mut secs = sleep_sections(body);
+    match secs.iter().position(|(h, _)| h == SLEEP_ME) {
+        Some(at) => secs[at].1 = strip(&format!("{lead}\n{}", secs[at].1)).to_string(),
+        None => secs.insert(0, (SLEEP_ME.to_string(), lead)),
+    }
+    sleep_join(&secs)
+}
+
 fn section_of(body: &str, heading: &str) -> Option<String> {
     sleep_sections(body).into_iter().rev().find(|(h, _)| h == heading).map(|(_, t)| t)
 }
@@ -1140,7 +1187,8 @@ fn sleep_age(day: Option<&str>, today: i64) -> String {
     let Some(day) = day.filter(|d| !d.is_empty()) else { return String::new() };
     let Some(d) = sleep_date(day) else { return String::new() };
     let n = today - d;
-    format!("last edited {day}, {}", if n == 0 { "today".to_string() } else { format!("{n} days ago") })
+    let ago = if n <= 0 { "today".to_string() } else if n == 1 { "1 day ago".to_string() } else { format!("{n} days ago") };
+    format!("last edited {day}, {ago}")
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1166,9 +1214,10 @@ pub(crate) fn sleep_box_index(view: &SleepView, today: i64) -> String {
         .iter()
         .map(|&s| {
             let f = &view[s];
-            let name = if f.title.is_empty() { "(empty)" } else { &f.title };
-            let age = if sleep_has_body(f) { format!(" ({})", sleep_age(f.day.as_deref(), today)) } else { String::new() };
-            format!("{s}. {name}{age}")
+            let name = sleep_named(&f.title);
+            let name = if name.is_empty() { "(empty)" } else { &name };
+            let age = if sleep_has_body(f) { sleep_age(f.day.as_deref(), today) } else { String::new() };
+            if age.is_empty() { format!("{s}. {name}") } else { format!("{s}. {name} ({age})") }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1176,14 +1225,12 @@ pub(crate) fn sleep_box_index(view: &SleepView, today: i64) -> String {
 
 pub(crate) fn sleep_render(view: &SleepView, today: i64) -> String {
     let core = &view[0];
-    let head = match core.day.as_deref().filter(|d| !d.is_empty()) {
-        Some(d) => format!("<core {}>", sleep_age(Some(d), today)),
-        None => "<core>".to_string(),
-    };
-    let secs = sleep_sections(core.body.as_deref().unwrap_or(""));
+    let age = sleep_age(core.day.as_deref(), today);
+    let head = if age.is_empty() { "<core>".to_string() } else { format!("<core {age}>") };
+    let secs = sleep_sections(&sleep_core(core.body.as_deref().unwrap_or("")));
     let (me, people): (Vec<_>, Vec<_>) = secs.into_iter().partition(|(h, _)| h == SLEEP_ME);
     let body = sleep_join(&[me, people].concat());
-    format!("{head}\n{}\n</core>\n<boxes>\n{}\n</boxes>", strip(&body), sleep_box_index(view, today))
+    format!("{head}\n{}\n</core>\n<boxes>\n{}\n</boxes>", sleep_kept(strip(&body)), sleep_box_index(view, today))
 }
 
 pub(crate) fn sleep_box_pick(view: &SleepView, which: &str) -> Option<usize> {
@@ -1205,7 +1252,9 @@ pub(crate) fn sleep_box_text(s: usize, f: &SleepFile, today: i64) -> String {
     if strip(body).is_empty() {
         return format!("Box {s} is empty.");
     }
-    format!("<box {s} name=\"{}\" {}>\n{}\n</box>", f.title, sleep_age(f.day.as_deref(), today), strip(body))
+    let age = sleep_age(f.day.as_deref(), today);
+    let age = if age.is_empty() { age } else { format!(" {age}") };
+    format!("<box {s} name=\"{}\"{age}>\n{}\n</box>", sleep_named(&f.title), sleep_kept(strip(body)))
 }
 
 pub(crate) fn box_arg(v: Option<&Value>) -> String {
@@ -1817,7 +1866,8 @@ async fn sleep_read_one(
 ) -> Result<ReaderOut, ModelCallError> {
     let digest = sleep_people(SLEEP_DIGEST, SLEEP_ONE_PERSON.digest, SLEEP_MANY_PEOPLE.digest, many);
     let system = fill(&digest, &[("being", Arg::Text(&n.run.being)), ("k", Arg::Num(k as i128)), ("n", Arg::Num(of as i128))]);
-    let core = if core.is_empty() { "(empty)" } else { core };
+    let core = sleep_kept(core);
+    let core = if core.is_empty() { "(empty)" } else { &core };
     let user = format!("<core>\n{core}\n</core>\n<boxes>\n{titles}\n</boxes>\n<memories>\n{}\n</memories>", sleep_lines(part));
     let mut got = None;
     for attempt in 1..=3 {
@@ -1888,8 +1938,8 @@ async fn sleep_settle(n: &Night<'_>, core: &str, sec: &str, text: &str) -> Resul
     if held.iter().filter(|ln| !tonight.contains(&ln.as_str())).count() <= SLEEP_OVERTURN {
         return Ok((Some(text), "kept".into()));
     }
-    let numbered = held.iter().enumerate().map(|(i, ln)| format!("{}. {ln}", i + 1)).collect::<Vec<_>>().join("\n");
-    let system = fill(SLEEP_SETTLE, &[("being", Arg::Text(&n.run.being)), ("name", Arg::Text(sec))]);
+    let numbered = held.iter().enumerate().map(|(i, ln)| format!("{}. {}", i + 1, sleep_kept(ln))).collect::<Vec<_>>().join("\n");
+    let system = fill(SLEEP_SETTLE, &[("being", Arg::Text(&n.run.being)), ("name", Arg::Text(&sleep_named(sec)))]);
     let user = format!("<as it stood>\n{numbered}\n</as it stood>\n<tonight>\n{text}\n</tonight>");
     let Some(g) = n.merge.ask_json(&system, &user, &format!("settle {sec}"), &n.log).await? else {
         return Ok((None, "unshaped".into()));
@@ -1948,7 +1998,7 @@ fn sleep_put_back(new: &mut Files, files: &Files, k: usize, carried: &[(usize, u
 }
 
 fn sleep_where(new: &Files, k: usize) -> String {
-    if k == 0 { "core".into() } else { format!("box \"{}\"", new[k].title) }
+    if k == 0 { "core".into() } else { format!("box \"{}\"", sleep_named(&new[k].title)) }
 }
 
 fn sleep_cap(s: &SleepSettings, k: usize) -> u64 {
@@ -1981,7 +2031,7 @@ async fn sleep_room(
             ("moved", Arg::Text(moved)),
         ],
     );
-    let user = format!("<{where_}>\n{}\n</{where_}>", new[k].body);
+    let user = format!("<{where_}>\n{}\n</{where_}>", sleep_kept(&new[k].body));
     let g = n.merge.ask_json(&system, &user, &format!("room {k}"), &n.log).await?.unwrap_or_default();
     let text = text_or_empty(g.get("text"));
     let mut body = strip(&text).to_string();
@@ -2223,7 +2273,10 @@ async fn sleep_done_flow(n: &Night<'_>, sleep_id: &str) -> Result<Value, WosErro
 fn sleep_titles<'a>(title: impl Fn(usize) -> &'a String) -> String {
     SLEEP_BOXES
         .iter()
-        .map(|&k| format!("{k}: {}", if title(k).is_empty() { "(empty)" } else { title(k) }))
+        .map(|&k| {
+            let name = sleep_named(title(k));
+            format!("{k}: {}", if name.is_empty() { "(empty)" } else { &name })
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2264,7 +2317,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
     let mut files: Files = Default::default();
     files[0] = Held {
         title: view[0].title.clone(),
-        body: view[0].body.clone().unwrap_or_default(),
+        body: sleep_core(view[0].body.as_deref().unwrap_or("")),
         version: view[0].version,
         day: view[0].day.clone(),
     };
@@ -2382,10 +2435,10 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 let f = &files[k];
                 format!(
                     "<box {k} name=\"{}\" size=\"{} of {} tokens\">\n{}\n</box {k}>",
-                    if f.title.is_empty() { "(empty)" } else { &f.title },
+                    if f.title.is_empty() { "(empty)".to_string() } else { sleep_named(&f.title) },
                     commas(count.of(&f.body).into()),
                     commas(s.box_tokens.into()),
-                    if f.body.is_empty() { "(empty)" } else { &f.body }
+                    if f.body.is_empty() { "(empty)".to_string() } else { sleep_kept(&f.body) }
                 )
             })
             .collect::<Vec<_>>()
@@ -2396,15 +2449,19 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             .map(|p| {
                 format!(
                     "{}: {} (seen in {} sleeps since {})",
-                    field(p, "id"),
-                    field(p, "text"),
+                    sleep_named(&field(p, "id")),
+                    sleep_shown(&field(p, "text")),
                     field(p, "sleeps"),
-                    field(p, "first_day")
+                    sleep_named(&field(p, "first_day"))
                 )
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let ripe_text = ripe.iter().map(|p| format!("{}: {}", field(p, "id"), field(p, "text"))).collect::<Vec<_>>().join("\n");
+        let ripe_text = ripe
+            .iter()
+            .map(|p| format!("{}: {}", sleep_named(&field(p, "id")), sleep_shown(&field(p, "text"))))
+            .collect::<Vec<_>>()
+            .join("\n");
         let self_rule = fill(SLEEP_SELF_RULE, &[("me", Arg::Text(me)), ("being", Arg::Text(being))]);
         let merge = sleep_people(SLEEP_MERGE, SLEEP_ONE_PERSON.merge, SLEEP_MANY_PEOPLE.merge, many);
         let system = fill(
@@ -2421,7 +2478,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
         );
         let user = format!(
             "<core>\n{}\n</core>\n{blocks}\n<proposals>\n{}\n</proposals>\n<ripe>\n{}\n</ripe>\n<items>\n{}\n</items>",
-            if core.is_empty() { "(empty)" } else { &core },
+            if core.is_empty() { "(empty)".to_string() } else { sleep_kept(&core) },
             if prop_text.is_empty() { "(none)" } else { &prop_text },
             if ripe_text.is_empty() { "(none)" } else { &ripe_text },
             items_json(&items)
@@ -2456,6 +2513,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             let nm = strip(name).to_lowercase();
             tonight.iter().any(|t| sleep_speaks_of(t, &nm))
         };
+        let own: Vec<String> =
+            [me, being, assistant.as_str()].iter().map(|x| strip(x).to_lowercase()).filter(|x| !x.is_empty()).collect();
+        let selfish = |name: &str| own.contains(&strip(name).to_lowercase());
         let section_name = |v: Option<&Value>| sleep_heading(&text_or_empty(v)).to_string();
         let edits = match got.get("edits") {
             Some(Value::Array(a)) => a.clone(),
@@ -2486,7 +2546,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 }
                 Some(slot) if op == "rewrite" => {
                     let sec = section_name(eo.get("section"));
-                    let sec = if slot == 0 && sec.to_lowercase() == me.to_lowercase() { me.to_string() } else { sec };
+                    let sec = if slot == 0 && selfish(&sec) { me.to_string() } else { sec };
                     if sec.is_empty() || strip(&text_or_empty(eo.get("text"))).is_empty() {
                         why = Some("rewrite needs a section and text".into());
                     } else if slot == 0 && sec == me && !is_ripe_id(eo.get("ripe")) {
@@ -2530,6 +2590,20 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                         new[slot].body =
                             if body.starts_with("## ") { body } else { sleep_set_section("", "Notes", &body, false) };
                         new[slot].title = title.chars().take(80).collect();
+                        let mut here: Vec<(String, String)> = Vec::new();
+                        for (src, dst, moved_sec, moved_text) in &ledger.carried {
+                            if *dst == slot {
+                                here.retain(|(h, _)| h != moved_sec);
+                                here.push((moved_sec.clone(), moved_text.clone()));
+                            } else if *src == slot {
+                                here.retain(|(h, _)| h != moved_sec);
+                            }
+                        }
+                        for (moved_sec, moved_text) in here {
+                            if section_of(&new[slot].body, &moved_sec).is_none() {
+                                new[slot].body = sleep_set_section(&new[slot].body, &moved_sec, &moved_text, false);
+                            }
+                        }
                         for (h, _) in sleep_sections(&new[slot].body) {
                             touched.insert((slot, h));
                         }
@@ -2539,10 +2613,13 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                     let to = slot_of(eo.get("to"));
                     let sec = section_name(eo.get("section"));
                     match to {
-                        Some(to) if to != slot && !((slot == 0 || to == 0) && sec.to_lowercase() == me.to_lowercase()) => {
+                        Some(to) if to != slot && !((slot == 0 || to == 0) && selfish(&sec)) => {
                             let (body, text) = sleep_drop_section(&new[slot].body, &sec);
                             match text {
                                 None => why = Some("no such section".into()),
+                                Some(_) if section_of(&new[to].body, &sec).is_some() => {
+                                    why = Some("move needs a section the file does not hold".into())
+                                }
                                 Some(text) => {
                                     new[slot].body = body;
                                     new[to].body = sleep_set_section(&new[to].body, &sec, &text, false);
@@ -2593,11 +2670,11 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 .split('\n')
                 .filter(|ln| !strip(ln).is_empty())
                 .enumerate()
-                .map(|(i, ln)| format!("{}: {ln}", i + 1))
+                .map(|(i, ln)| format!("{}: {}", i + 1, sleep_kept(ln)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let system = fill(SLEEP_TIDY, &[("being", Arg::Text(being)), ("where", Arg::Text(&where_))]);
-            let user = format!("<section heading=\"{h}\">\n{numbered}\n</section>");
+            let user = format!("<section heading=\"{}\">\n{numbered}\n</section>", sleep_named(h));
             let g = n.merge.ask_json(&system, &user, &format!("tidy {k}:{h}"), log).await?.unwrap_or_default();
             if let Some(text) = sleep_doubt_lines_out(&t, g.get("drop"), count) {
                 tidied.push(json!({"file": k, "section": h, "before": count.of(&t), "after": count.of(&text),
@@ -2634,7 +2711,7 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                         ("lines", Arg::Num(limit as i128)),
                     ],
                 );
-                let user = format!("<section heading=\"{h}\">\n{t}\n</section>");
+                let user = format!("<section heading=\"{}\">\n{}\n</section>", sleep_named(&h), sleep_kept(&t));
                 let g = n.merge.ask_json(&system, &user, &format!("fold {k}:{h}"), log).await?.unwrap_or_default();
                 let text = sleep_as_lines(&text_or_empty(g.get("text")));
                 let ok_lines = text.split('\n').filter(|ln| !strip(ln).is_empty()).count();
@@ -3679,7 +3756,7 @@ mod tests {
         );
         assert_eq!((SLEEP_PAGE_TOKENS, SLEEP_LINE_FRAME, SLEEP_MAX_TOKENS), (20_000, 12, 16_000));
         assert_eq!((SLEEP_IN_PER_100, SLEEP_OUT_PER_100, SLEEP_MARGIN, SLEEP_ESTIMATE_PRICES), (172, 7, 0.15, (2.0, 10.0)));
-        assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.1", "1.0.1"));
+        assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.2", "1.0.2"));
         let o = SleepOpts::default();
         assert_eq!((o.being.as_str(), o.prompt.as_str(), o.done, o.max_tokens), ("the assistant", "", true, 16_000));
         assert_eq!((o.line_time, o.settings), (SleepLineTime::CreatedAt, s));
@@ -4493,7 +4570,7 @@ mod tests {
         let frame = sleep_tokens(SLEEP_DIGEST) + sleep_tokens("") + sleep_tokens("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)");
         let (sent, written) = (((tokens + frame) * 172).div_ceil(100), (tokens * 7).div_ceil(100));
         let basis = |prices: [f64; 2]| {
-            json!({"sleep_version": "1.0.1", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
+            json!({"sleep_version": "1.0.2", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
                    "margin": 0.15, "prices": prices})
         };
         let cost = round_to((sent as f64 * 1.0 + written as f64 * 5.0) * 1.15 / 1_000_000.0, 6);
@@ -4889,4 +4966,5 @@ mod tests {
     mod attacks;
     mod held;
     mod hunt;
+    mod v102;
 }

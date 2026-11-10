@@ -1252,8 +1252,8 @@
             let r = wos.ask("Weather tomorrow?", None, &opts()).await.unwrap();
             assert!(r.ok, "{status}: {:?}", r.detail);
             assert_eq!(r.text, "Sunny.");
-            assert_eq!((r.history.read, r.history.pushed), (HistoryStep::Failed, HistoryStep::Failed), "{status}");
-            assert_eq!(e.paths().iter().filter(|p| p.ends_with("/channel/push")).count(), 1, "{status}");
+            assert_eq!((r.history.read, r.history.pushed), (HistoryStep::Skipped, HistoryStep::Skipped), "{status}");
+            assert_eq!(e.paths().iter().filter(|p| p.ends_with("/channel/push")).count(), 0, "{status}");
             assert!(wos.router_history(None, None).await.unwrap().is_empty(), "{status}");
             assert!(wos.router_history("u", Some("Ana")).await.unwrap().is_empty(), "{status}");
         }

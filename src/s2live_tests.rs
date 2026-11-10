@@ -18,7 +18,7 @@ const RESULTS: [&str; 3] = [
 ];
 const PLAIN: &str = r#"{"user_id":"u","question":"what did we plan"}"#;
 const LATER: [&str; 2] = [r#"{"user_id":"u","work_id":"w-1"}"#, r#"{"user_id":"u","work_id":"w-1","query":"the cake"}"#];
-const OTHERS: &str = r#","filters":{"source_types":["user_said","ai_thought","inferred","system"]}"#;
+const OTHERS: &str = r#","own_words":false"#;
 const FULL: &str = r#","diversity":"full""#;
 
 fn iso(ms: i64) -> String {
@@ -152,7 +152,8 @@ async fn the_filter_and_diversity_go_on_the_open_and_later_looks_send_nothing_ne
     assert_eq!(paths(&seen), [HISTORY, WORK_PATHS[0], WORK_PATHS[1], WORK_PATHS[2]]);
     let sent = bodies(&seen);
     let opened: serde_json::Value = serde_json::from_str(&sent[1]).unwrap();
-    assert_eq!(opened["filters"], json!({"source_types": ["user_said", "ai_thought", "inferred", "system"]}));
+    assert_eq!(opened["own_words"], json!(false));
+    assert!(opened.get("filters").is_none());
     assert_eq!(opened["diversity"], "full");
     assert_eq!(sent[1], live(&format!("we booked the cabin\n{Q}")));
     assert_eq!(sent[2..], LATER);

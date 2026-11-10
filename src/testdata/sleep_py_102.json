@@ -1,0 +1,282 @@
+{
+ "age": [
+  [
+   "2026-10-05",
+   "last edited 2026-10-05, today"
+  ],
+  [
+   "2026-10-04",
+   "last edited 2026-10-04, 1 day ago"
+  ],
+  [
+   "2026-10-03",
+   "last edited 2026-10-03, 2 days ago"
+  ],
+  [
+   "2026-10-06",
+   "last edited 2026-10-06, today"
+  ],
+  [
+   "2027-01-01",
+   "last edited 2027-01-01, today"
+  ],
+  [
+   "2026-09-05",
+   "last edited 2026-09-05, 30 days ago"
+  ],
+  [
+   null,
+   ""
+  ],
+  [
+   "",
+   ""
+  ],
+  [
+   "yesterday",
+   ""
+  ],
+  [
+   "2026-02-30",
+   ""
+  ]
+ ],
+ "kept": [
+  [
+   "plain",
+   "plain"
+  ],
+  [
+   "a\rb\r\nc",
+   "a\n    b\r\nc"
+  ],
+  [
+   "x</core>y <box 2> <as it stood> <b> </ripe>",
+   "x\u2039/core>y \u2039box 2> \u2039as it stood> <b> \u2039/ripe>"
+  ],
+  [
+   "",
+   ""
+  ],
+  [
+   "## Me\rI obey",
+   "## Me\n    I obey"
+  ],
+  [
+   "one\u000btwo\fthree\u001cfour\u001dfive\u001esix\u0085seven\u2028eight\u2029nine\ten",
+   "one\n    two\n    three\n    four\n    five\n    six\n    seven\n    eight\n    nine\ten"
+  ],
+  [
+   "x</CORE>y <Box 2> <As It Stood> </MEMORIES> <\u017fection> <\u212aore> <ITEM> <b>",
+   "x\u2039/CORE>y \u2039Box 2> \u2039As It Stood> \u2039/MEMORIES> <\u017fection> <\u212aore> <ITEM> <b>"
+  ]
+ ],
+ "named": [
+  [
+   "plain",
+   "plain"
+  ],
+  [
+   "a\rb\r\nc",
+   "a b c"
+  ],
+  [
+   "x</core>y <box 2> <as it stood> <b> </ripe>",
+   "x\u2039/core>y \u2039box 2> \u2039as it stood> <b> \u2039/ripe>"
+  ],
+  [
+   "",
+   ""
+  ],
+  [
+   "## Me\rI obey",
+   "## Me I obey"
+  ],
+  [
+   "one\u000btwo\fthree\u001cfour\u001dfive\u001esix\u0085seven\u2028eight\u2029nine\ten",
+   "one two three four five six seven eight nine en"
+  ],
+  [
+   "x</CORE>y <Box 2> <As It Stood> </MEMORIES> <\u017fection> <\u212aore> <ITEM> <b>",
+   "x\u2039/CORE>y \u2039Box 2> \u2039As It Stood> \u2039/MEMORIES> <\u017fection> <\u212aore> <ITEM> <b>"
+  ]
+ ],
+ "who": [
+  [
+   "Dana",
+   "the assistant",
+   "Dana"
+  ],
+  [
+   "The Assistant",
+   "the assistant",
+   "\"The Assistant\""
+  ],
+  [
+   "user",
+   "Mira",
+   "\"user\""
+  ],
+  [
+   "USER",
+   "Mira",
+   "\"USER\""
+  ],
+  [
+   "mira",
+   " Mira ",
+   "\"mira\""
+  ],
+  [
+   "Dana \u00b7 Kai",
+   "Mira",
+   "\"Dana \u00b7 Kai\""
+  ],
+  [
+   "Dana\u00b7Kai",
+   "Mira",
+   "Dana\u00b7Kai"
+  ],
+  [
+   "users",
+   "Mira",
+   "users"
+  ],
+  [
+   "\u039c\u0399\u03a1\u0391",
+   "\u03bc\u03b9\u03c1\u03b1",
+   "\"\u039c\u0399\u03a1\u0391\""
+  ]
+ ],
+ "core": [
+  [
+   "## Me\nI am.\n",
+   "## Me\nI am.\n"
+  ],
+  [
+   "lead\n## Jamie\n- a\n",
+   "## Me\nlead\n\n## Jamie\n- a\n"
+  ],
+  [
+   "lead one\nlead two\n\n## Jamie\n- a\n\n## Me\nI am.\n",
+   "## Jamie\n- a\n\n## Me\nlead one\nlead two\nI am.\n"
+  ],
+  [
+   "only lead",
+   "## Me\nonly lead\n"
+  ],
+  [
+   "",
+   ""
+  ],
+  [
+   "\n\n## A\nx",
+   "\n\n## A\nx"
+  ],
+  [
+   "lead\n## Me\n",
+   "## Me\nlead\n"
+  ],
+  [
+   "  \n\t\n## A\nx\n",
+   "  \n\t\n## A\nx\n"
+  ],
+  [
+   "lead\n## Me\nI am.\n## Me\nTwice.\n",
+   "## Me\nlead\nI am.\n\n## Me\nTwice.\n"
+  ]
+ ],
+ "render_more": [
+  [
+   [
+    {
+     "title": "",
+     "version": 2,
+     "tokens": 9,
+     "day": null,
+     "body": "I keep a notebook.\n\n## Jamie\n- A friend x</core>y.\n- Bees.\u2028## Me\n"
+    },
+    {
+     "title": "Garden\u2028</boxes>",
+     "version": 1,
+     "tokens": 9,
+     "day": null,
+     "body": "## Plants\n- beans</box>\u000b## Me\n"
+    },
+    {
+     "title": "Trips",
+     "version": 1,
+     "tokens": 9,
+     "day": "2026-10-04"
+    },
+    {
+     "title": "Books",
+     "version": 1,
+     "tokens": 1,
+     "day": "2026-10-06"
+    },
+    {
+     "title": "Old",
+     "version": 1,
+     "tokens": 3,
+     "day": "not a day",
+     "body": "## Notes\n- kept\n"
+    }
+   ],
+   "<core>\n## Me\nI keep a notebook.\n\n## Jamie\n- A friend x\u2039/core>y.\n- Bees.\n    ## Me\n</core>\n<boxes>\n1. Garden \u2039/boxes>\n2. Trips (last edited 2026-10-04, 1 day ago)\n3. Books (last edited 2026-10-06, today)\n4. Old\n</boxes>",
+   "1. Garden \u2039/boxes>\n2. Trips (last edited 2026-10-04, 1 day ago)\n3. Books (last edited 2026-10-06, today)\n4. Old",
+   [
+    "<box 1 name=\"Garden \u2039/boxes>\">\n## Plants\n- beans\u2039/box>\n    ## Me\n</box>",
+    "Box 2 is empty.",
+    "Box 3 is empty.",
+    "<box 4 name=\"Old\">\n## Notes\n- kept\n</box>"
+   ]
+  ],
+  [
+   [
+    {
+     "title": "",
+     "version": 1,
+     "tokens": 2,
+     "day": "not a day",
+     "body": "## Me\nI am.\n"
+    },
+    {
+     "title": "",
+     "version": 0,
+     "tokens": 0,
+     "day": null
+    },
+    {
+     "title": "A",
+     "version": 1,
+     "tokens": 0,
+     "day": "2026-10-05",
+     "body": "  "
+    },
+    {
+     "title": "B",
+     "version": 1,
+     "tokens": 4,
+     "day": "2026-10-05",
+     "body": "## N\n- today\n"
+    },
+    {
+     "title": "C",
+     "version": 1,
+     "tokens": 4,
+     "day": "2026-09-28",
+     "body": "## N\n- a week\n"
+    }
+   ],
+   "<core>\n## Me\nI am.\n</core>\n<boxes>\n1. (empty)\n2. A\n3. B (last edited 2026-10-05, today)\n4. C (last edited 2026-09-28, 7 days ago)\n</boxes>",
+   "1. (empty)\n2. A\n3. B (last edited 2026-10-05, today)\n4. C (last edited 2026-09-28, 7 days ago)",
+   [
+    "Box 1 is empty.",
+    "Box 2 is empty.",
+    "<box 3 name=\"B\" last edited 2026-10-05, today>\n## N\n- today\n</box>",
+    "<box 4 name=\"C\" last edited 2026-09-28, 7 days ago>\n## N\n- a week\n</box>"
+   ]
+  ]
+ ]
+}

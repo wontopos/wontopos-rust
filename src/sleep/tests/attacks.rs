@@ -14,6 +14,7 @@ fn expand(v: &Value) -> Value {
         }
         Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), expand(x))).collect()),
         Value::Array(a) => Value::Array(a.iter().map(expand).collect()),
+        Value::String(t) => Value::String(t.replace("@@ASSISTANT@@", "Kai")),
         other => other.clone(),
     }
 }
@@ -160,7 +161,10 @@ fn served() -> (Svc, Client, String) {
     (svc, mem, base)
 }
 
-fn check_night(scenario: &Value, n: usize, night: &Value, res: &Value, svc: &Svc, start: usize, reads: &[String]) {
+#[allow(clippy::too_many_arguments)]
+fn check_night(
+    scenario: &Value, n: usize, night: &Value, res: &Value, svc: &Svc, start: usize, reads: &[String], calls: &[String],
+) {
     let where_ = format!("{} night {}", scenario["name"].as_str().unwrap(), n + 1);
     let want = &night["expect"];
     for s in strings(&want["read_has"]) {
@@ -169,7 +173,17 @@ fn check_night(scenario: &Value, n: usize, night: &Value, res: &Value, svc: &Svc
     for s in strings(&want["read_lacks"]) {
         assert!(!reads.iter().any(|r| r.contains(&s)), "{where_}: no reader was sent {s:?}");
     }
+    for s in strings(&want["calls_have"]) {
+        assert!(calls.iter().any(|c| c.contains(&s)), "{where_}: a model call held {s:?}");
+    }
+    for s in strings(&want["calls_lack"]) {
+        assert!(!calls.iter().any(|c| c.contains(&s)), "{where_}: no model call held {s:?}");
+    }
     let st = svc.lock().unwrap();
+    let latest: Vec<String> = (0..5).filter_map(|k| st.latest(k).map(|v| v.body.clone())).collect();
+    for s in strings(&want["files_have"]) {
+        assert!(latest.iter().any(|f| f.contains(&s)), "{where_}: a file holds {s:?}");
+    }
     let core = st.latest(0).map(|v| v.body.clone()).unwrap_or_default();
     let files: Vec<String> = st.slots.iter().flatten().map(|v| format!("{}\n{}", v.body, v.title)).collect();
     let notes = st.notes.clone().unwrap_or(json!({})).to_string();
@@ -266,6 +280,20 @@ async fn planted_instructions_meet_the_rules_as_the_fixture_says() {
         if let Some(p) = scenario["before"].get("proposals") {
             svc.lock().unwrap().notes = Some(json!({"proposals": p, "mixed": []}));
         }
+        if let Some(files) = scenario["before"].get("files").and_then(Value::as_object) {
+            for (k, f) in files {
+                let body = text_of(&f["body"]);
+                svc.lock().unwrap().slots[k.parse::<usize>().unwrap()].push(Version {
+                    version: 1,
+                    title: f.get("title").map(text_of).unwrap_or_default(),
+                    tokens: sleep_tokens(&body) as i64,
+                    body,
+                    evidence: json!([]),
+                    day: f.get("day").cloned().unwrap_or(Value::Null),
+                    sleep_id: Value::Null,
+                });
+            }
+        }
         for (n, night) in scenario["nights"].as_array().unwrap().iter().enumerate() {
             give(&svc, night_rows(n, night));
             let start = svc.lock().unwrap().seen.len();
@@ -279,7 +307,8 @@ async fn planted_instructions_meet_the_rules_as_the_fixture_says() {
             let res = mem.sleep("u", model.clone(), &opts).await.unwrap_or_else(|e| panic!("{}: {e}", scenario["name"]));
             let reads: Vec<String> =
                 model.calls.lock().unwrap().iter().filter(|(s, _)| s.contains(" you read part ")).map(|(_, u)| u.clone()).collect();
-            check_night(scenario, n, night, &res, &svc, start, &reads);
+            let calls: Vec<String> = model.calls.lock().unwrap().iter().map(|(s, u)| format!("{s}\n{u}")).collect();
+            check_night(scenario, n, night, &res, &svc, start, &reads, &calls);
         }
     }
 }

@@ -79,6 +79,11 @@ impl RecallResponse {
         memories_from(self.long_term.get("memories"))
     }
 
+    /// The memories from the rooms (from Scroll 2 on).
+    pub fn room_memories(&self) -> Vec<Memory> {
+        memories_from(self.extra.get("rooms").and_then(|r| r.get("memories")))
+    }
+
     /// The conversation around the best memory, in order.
     pub fn context_rows(&self) -> Vec<String> {
         self.context
@@ -131,14 +136,15 @@ pub struct RecallOpts {
     pub long_term_cutoff: Option<bool>,
     pub today_start: Option<String>,
     pub now: Option<String>,
-    /// Lines of the recent conversation, 0-500.
+    /// Lines of the recent conversation, 0-500 (from Scroll 2 on; Tablet 2 ignores it).
     pub short_term_limit: Option<usize>,
-    /// Tokens of those lines, 0-8000; 0 sets no limit.
+    /// Tokens of those lines, 0-8000; 0 sets no limit (from Scroll 2 on; Tablet 2 ignores it).
     pub short_term_budget_tokens: Option<u32>,
-    /// Image memories, 0-5.
+    /// Image memories, 0-5 (from Scroll 2 on; Tablet 2 ignores it).
     pub max_images: Option<usize>,
     pub filters: Option<serde_json::Value>,
     pub speaker: Option<String>,
+    /// Also recall memories a later one replaced (from Scroll 2 on; Tablet 2 ignores it).
     pub include_superseded: Option<bool>,
 }
 
@@ -215,7 +221,7 @@ pub struct WriteOpts {
     /// Also put the line in the short-term window.
     pub window: Option<bool>,
     pub window_role: Option<String>,
-    /// When the turn was said, RFC3339 with an offset.
+    /// When it was said, RFC3339 with an offset: a turn's, or on `add` one memory's (from Scroll 2 on).
     pub created_at: Option<String>,
     pub user_speaker: Option<String>,
     pub assistant_speaker: Option<String>,
@@ -322,7 +328,7 @@ pub struct DefaultSpeakers {
 #[derive(Debug, Clone, Default)]
 pub struct BulkOpts {
     pub speaker: Option<String>,
-    /// A conversation in parts, in place of `content`.
+    /// A conversation in parts, in place of `content` (from Scroll 2 on; a model before it refuses them).
     pub segments: Option<Vec<Segment>>,
     pub timestamp: Option<String>,
 }

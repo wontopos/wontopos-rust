@@ -68,7 +68,7 @@ pub(crate) fn warn_if_store_id_collapses(id: &str) {
 
 pub(crate) const KNOWN_FILTER_KEYS: [&str; 7] = ["categories", "event_from", "event_to", "time_from", "time_to", "min_importance", "speakers"];
 
-pub(crate) const KNOWN_METADATA_KEYS: [&str; 4] = ["speaker", "event_date", "category", "conversation_id"];
+pub(crate) const KNOWN_METADATA_KEYS: [&str; 5] = ["speaker", "event_date", "category", "conversation_id", "created_at"];
 
 pub(crate) const WARNED_KEYS_MAX: usize = 1024;
 pub(crate) type WarnSet = std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>>;
@@ -210,6 +210,35 @@ pub(crate) fn refuse_turn_fields(opts: &WriteOpts) -> Result<(), WosError> {
     for (name, v) in [("created_at", &opts.created_at), ("user_speaker", &opts.user_speaker), ("assistant_speaker", &opts.assistant_speaker)] {
         if v.is_some() {
             return Err(refused(format!("{name} is for add_turn_opts: it dates or names a side of a turn.")));
+        }
+    }
+    Ok(())
+}
+
+/// `add` takes when it was said; the two sides of a turn stay `add_turn_opts`'s. The time goes in `metadata.created_at`.
+pub(crate) fn add_fields(metadata: &mut serde_json::Value, opts: &WriteOpts) -> Result<(), WosError> {
+    let sides = [
+        ("user_speaker", opts.user_speaker.is_some() || metadata.get("user_speaker").is_some_and(|v| !v.is_null())),
+        ("assistant_speaker", opts.assistant_speaker.is_some() || metadata.get("assistant_speaker").is_some_and(|v| !v.is_null())),
+    ];
+    for (name, given) in sides {
+        if given {
+            return Err(refused(format!(
+                "{name} is for add_turn_opts: it names a side of a turn. On add, name who said it in metadata.speaker."
+            )));
+        }
+    }
+    let at = match (&opts.created_at, metadata.get("created_at")) {
+        (Some(at), _) => Some(check_instant(at, "created_at")?),
+        (None, Some(v)) if !v.is_null() => Some(check_instant(v.as_str().unwrap_or_default(), "created_at")?),
+        _ => None,
+    };
+    if let Some(at) = at {
+        if metadata.is_null() {
+            *metadata = serde_json::json!({});
+        }
+        if let Some(md) = metadata.as_object_mut() {
+            md.insert("created_at".into(), serde_json::json!(at));
         }
     }
     Ok(())

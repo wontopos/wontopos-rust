@@ -1654,7 +1654,7 @@
             one(&json!({"event_date": "soon", "created_at": "2026-09-30T04:00:00Z"}), Some(9.0)),
             "2026-09-30\n13:00 [01] user: "
         );
-        assert_eq!(one(&json!({"event_date": "9999-12-31T23:00:00Z"}), Some(9.0)), "+010000-01\n01T08 [01] user: ");
+        assert_eq!(one(&json!({"event_date": "9999-12-31T23:00:00Z"}), Some(9.0)), "+010000-01-01\n08:00 [01] user: ");
         for (m, who) in [
             (json!({"speaker": "me", "created_at": "soon"}), "you"),
             (json!({"speaker": "Kai"}), "you"),

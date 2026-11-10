@@ -41,7 +41,7 @@ impl Client {
         self.post_until_complete("/api/v1/memory/speakers/relabel", serde_json::Value::Object(obj)).await
     }
 
-    /// Delete everything a person said in this store.
+    /// Delete everything a person said in this store (from Tablet 2 on).
     pub async fn forget_speaker(
         &self, speakers: impl IntoIterator<Item = impl AsRef<str>>, user_id: &str, preview: bool,
     ) -> Result<serde_json::Value, WosError> {

@@ -76,7 +76,6 @@ fn live_question(turns: &[serde_json::Value], question: &str, now: i64) -> Strin
 }
 
 static DIVERSITIES: [&str; 4] = ["none", "mmr", "temporal", "full"];
-pub(crate) static NOT_ASSISTANT_SOURCES: [&str; 4] = ["user_said", "ai_thought", "inferred", "system"];
 
 pub(crate) fn check_diversity(diversity: &str) -> Result<&'static str, WosError> {
     DIVERSITIES.iter().copied().find(|d| *d == diversity).ok_or_else(|| {
@@ -837,16 +836,16 @@ pub(crate) fn said_of(
     let shift = own.map_or(tz.unwrap_or(0.0) * 3_600_000.0, |o| o * 60_000.0);
     let (date, time, zone) = match at {
         None => (None, None, String::new()),
-        Some(t) if ev.is_some() && t % 86_400_000 == 0 => (Some(iso_minute(t)[..10].to_string()), None, String::new()),
+        Some(t) if ev.is_some() && t % 86_400_000 == 0 => (Some(day_minute(t).0), None, String::new()),
         Some(t) => {
-            let iso = iso_minute((t as f64 + shift).trunc() as i64);
+            let (day, minute) = day_minute((t as f64 + shift).trunc() as i64);
             let zone = match own {
                 Some(o) if tz.is_some_and(|h| o == h * 60.0) => String::new(),
                 Some(o) => utc_label(o),
                 None if tz.is_none() => "UTC".to_string(),
                 None => String::new(),
             };
-            (Some(iso[..10].to_string()), Some(iso[11..16].to_string()), zone)
+            (Some(day), Some(minute), zone)
         }
     };
     let speaker = field("speaker").map(js_trim).unwrap_or_default();
@@ -867,7 +866,7 @@ pub(crate) fn said_of(
             let again = format!(" (said at least {} times)", js_num(n));
             let first = rep.and_then(|r| r.get("first")).and_then(|f| f.get("created_at")).and_then(|v| v.as_str()).and_then(epoch_ms);
             let timed = match first {
-                Some(f) => format!(" (said at least {} times, first on {})", js_num(n), &iso_minute((f as f64 + shift).trunc() as i64)[..10]),
+                Some(f) => format!(" (said at least {} times, first on {})", js_num(n), day_minute((f as f64 + shift).trunc() as i64).0),
                 None => again.clone(),
             };
             (again, timed)

@@ -40,19 +40,19 @@ async fn main() -> Result<(), WosError> {
 | Method | What it does |
 |---|---|
 | **Write** | |
-| `add(content, user_id, metadata)` · `add_with` | Store one memory. Alias `store`. `add_with` takes an `image`. |
+| `add(content, user_id, metadata)` · `add_with` · `add_opts` | Store one memory. Alias `store`. `add_with` takes an `image`, and `add_opts` takes `created_at`, when it was said (from Scroll 2 on). |
 | `add_turn(user_msg, assistant_msg, user_id)` | Store one exchange of a conversation. |
 | `add_bulk(content, user_id, category)` · `add_bulk_with` | Backfill a long history in one call. |
 | `update(old_memory_id, new_content, user_id)` | Replace a fact that changed. The old version stays in its history. |
 | `*_idempotent` | The same writes with an idempotency key of your own. |
 | **Read** | |
 | `recall(query, user_id)` · `recall_opts` · `recall_with` | The recent turns, the memories that match and the conversation around the best one, in one call. |
-| `search(query, user_id, limit)` · `search_opts` · `search_with` | The memories that match, best first. |
+| `search(query, user_id, limit)` · `search_opts` · `search_with` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). |
 | `search_full` · `search_full_with` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self` · `search_self_with` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
 | `memory_tools_preset(user_id, None, "S-2")?.with_seen(true)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. |
-| `get(user_id, memory_id)` | One memory by id. |
+| `get(user_id, memory_id)` | One memory by id and its metadata. |
 | `list_memories` · `export_memories` | Every memory in a store, a page at a time or all at once. |
 | `lineage(user_id, memory_id)` | The edits that followed one memory. |
 | `revisions(user_id)` · `revisions_page` | How many of a store's memories were edited, and which. |
@@ -97,6 +97,10 @@ let mut system = String::from("What you remember about this user, most relevant 
 for m in ctx.memories() {
     system += &format!("- {}\n", m.content);
 }
+system += "\nFrom the last three days:\n";
+for m in ctx.room_memories() {
+    system += &format!("- {}\n", m.content);
+}
 system += "\nAround the most relevant memory:\n";
 for row in ctx.context_rows() {
     system += &format!("{row}\n");
@@ -111,7 +115,8 @@ mem.add_turn(&user_message, &reply, "alice").await?;
 ```
 
 Each row of `context_rows()` starts with `[before] `, `[match] ` or `[after] `: where it
-sits next to the best memory. Keep every list in the order it arrives.
+sits next to the best memory. Keep every list in the order it arrives. From Scroll 2 on, the rooms' memories, from the last three days, come in
+`room_memories()`; on a model before it that list is empty.
 
 ## Who said it (speakers)
 
@@ -307,7 +312,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Thirteen inside 2.2 were not, deliberately and each with its
+releases are additive. Fourteen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-rust/blob/main/CHANGELOG.md).

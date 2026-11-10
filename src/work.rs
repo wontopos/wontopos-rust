@@ -11,7 +11,7 @@ impl Client {
             obj.insert("max_images".into(), serde_json::json!(check_range("max_images", n, 0, MAX_IMAGES_MAX)?));
         }
         if opts.own_words == Some(false) {
-            obj.insert("filters".into(), serde_json::json!({"source_types": NOT_ASSISTANT_SOURCES}));
+            obj.insert("own_words".into(), serde_json::json!(false));
         }
         if let Some(d) = &opts.diversity {
             obj.insert("diversity".into(), serde_json::json!(check_diversity(d)?));

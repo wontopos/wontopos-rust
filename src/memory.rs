@@ -54,7 +54,7 @@ impl Client {
         if let Some(who) = metadata.get("speaker").and_then(|s| s.as_str()).map(|s| written_speaker(s, "speaker")).transpose()? {
             metadata["speaker"] = serde_json::json!(who);
         }
-        refuse_turn_fields(opts)?;
+        add_fields(&mut metadata, opts)?;
         let user_id = self.uid(user_id.into())?;
         warn_on_unknown_metadata(&metadata);
         let mut obj = extra.as_object().cloned().unwrap_or_default();

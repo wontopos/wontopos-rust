@@ -955,7 +955,8 @@ fn router_turn(exchanges: &[RouterExchange], clock: &RouterClock, now: i64, name
 fn skill_list(skills: &[SkillDefinition]) -> String {
     let mut lines = vec![router_text::SKILLS.to_string()];
     for s in skills {
-        lines.push(format!("- {}: {}\n  {} {}", s.name, kept_in(&s.description), router_text::SKILL_INPUT, js_json(&s.input)));
+        let shown = js_json(&s.input).replace('\u{85}', "\\u0085").replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+        lines.push(format!("- {}: {}\n  {} {}", s.name, kept_in(&s.description), router_text::SKILL_INPUT, shown));
     }
     lines.join("\n")
 }
@@ -1758,11 +1759,16 @@ impl Client {
         };
         let run = AskClock::new(lim.budget);
         let mut exchanges = Vec::new();
+        let mut no_channel = false;
         if use_history {
             match run.within(self.channel_read(&store, speaker.as_deref(), Some(&run))).await {
                 Some(Ok(e)) => {
                     exchanges = e;
                     run_state.history.read = HistoryStep::Ok;
+                }
+                Some(Err(WosError::Api { status: 404 | 501, .. })) => {
+                    no_channel = true;
+                    run_state.history.read = HistoryStep::Skipped;
                 }
                 _ => run_state.history.read = HistoryStep::Failed,
             }
@@ -1796,7 +1802,7 @@ impl Client {
             }
         };
         if use_history {
-            result.history.pushed = if run.expired() {
+            result.history.pushed = if no_channel || run.expired() {
                 HistoryStep::Skipped
             } else {
                 let answer = exchange_answer(&result);

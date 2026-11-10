@@ -8,7 +8,7 @@ const DEEPER: &str = r#"{"work_id":"w-1","memories":[{"n":2,"id":"b","content":"
 const SEARCH: &str = r#"{"work_id":"w-1","memories":[],"none":true,"steps_left":4}"#;
 const PATHS: [&str; 3] = ["/api/v1/memory/work/open", "/api/v1/memory/work/deeper", "/api/v1/memory/work/search"];
 const PLAIN: &str = r#"{"user_id":"u","question":"what did we plan"}"#;
-const OTHERS: &str = r#""filters":{"source_types":["user_said","ai_thought","inferred","system"]}"#;
+const OTHERS: &str = r#""own_words":false"#;
 const DIVERSITIES: [&str; 4] = ["none", "mmr", "temporal", "full"];
 
 fn plus(parts: &[&str]) -> String {
@@ -55,12 +55,13 @@ async fn defaults_open_the_work_with_the_same_bytes_as_before() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn own_words_off_names_every_source_but_the_assistants_and_later_looks_send_nothing_new() {
+async fn own_words_off_is_sent_as_own_words_false_and_later_looks_send_nothing_new() {
     let plain = turn(tools).await;
     let off = turn(|b| tools(b).with_own_words(false)).await;
     assert_eq!(off[0], plus(&[OTHERS]));
     let body: serde_json::Value = serde_json::from_str(&off[0]).unwrap();
-    assert_eq!(body["filters"], json!({"source_types": ["user_said", "ai_thought", "inferred", "system"]}));
+    assert_eq!(body["own_words"], json!(false));
+    assert!(body.get("filters").is_none());
     assert_eq!(off[1..], plain[1..]);
 }
 

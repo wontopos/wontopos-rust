@@ -723,7 +723,7 @@ fn kept_in(text: &str) -> String {
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+            '\r' | '\n' | '\u{b}' | '\u{c}' | '\u{1c}'..='\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
                 if c == '\r' && chars.peek() == Some(&'\n') {
                     chars.next();
                 }
@@ -870,6 +870,12 @@ fn iso_minute(ms: i64) -> String {
     };
     let minute = ms.rem_euclid(86_400_000) / 60_000;
     format!("{year}-{m:02}-{d:02}T{:02}:{:02}", minute / 60, minute % 60)
+}
+
+fn day_minute(ms: i64) -> (String, String) {
+    let iso = iso_minute(ms);
+    let (day, minute) = iso.split_once('T').unwrap_or((iso.as_str(), ""));
+    (day.to_string(), minute.to_string())
 }
 
 fn epoch_ms(s: &str) -> Option<i64> {
@@ -1319,5 +1325,6 @@ fn js_json(v: &serde_json::Value) -> String {
 #[cfg(test)] mod hunt_parity_tests;
 #[cfg(test)] mod hunt_livefix_tests;
 #[cfg(test)] mod s2live_tests;
+#[cfg(test)] mod v2251_tests;
 #[cfg(test)] mod cov_tests;
 #[cfg(test)] mod cov_rs_tests;
