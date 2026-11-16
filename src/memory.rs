@@ -198,7 +198,7 @@ impl Client {
         self.supersede(old_memory_id, new_content, user_id, &WriteOpts::default(), Some(idempotency_key)).await
     }
 
-    /// Search a store's memories.
+    /// Search a store's memories; for an LLM's context use [`Client::recall`], which also brings the recent turns and, from Scroll 2 on, the last three days.
     pub async fn search(&self, query: &str, user_id: impl Into<Option<&str>>, limit: usize) -> Result<Vec<Memory>, WosError> {
         self.search_with(query, user_id, limit, serde_json::json!({})).await
     }
@@ -256,7 +256,7 @@ impl Client {
         self.search_self_with(query, user_id, limit, serde_json::json!({})).await
     }
 
-    /// One-call context for an LLM: recent turns, long-term memories and the context around them.
+    /// One-call context for an LLM: recent turns, long-term memories and the context around them, and from Scroll 2 on the last three days by part of the day.
     pub async fn recall(&self, query: &str, user_id: impl Into<Option<&str>>) -> Result<RecallResponse, WosError> {
         self.recall_with(query, user_id, serde_json::json!({})).await
     }

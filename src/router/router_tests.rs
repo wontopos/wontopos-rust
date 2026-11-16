@@ -1099,7 +1099,8 @@
         let parsed: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["skills"].as_array().unwrap().iter().map(|s| s["name"].clone()).collect::<Vec<_>>(), [json!("add_event"), json!("lookup")]);
         assert_eq!(wos.import_skills(&text, "d").await.unwrap(), ["add_event", "lookup"]);
-        assert_eq!(wos.list_skills("d").await.unwrap(), wos.list_skills("a").await.unwrap());
+        let confirmed = SkillDefinition { confirm: Some(true), ..event() };
+        assert_eq!(wos.list_skills("d").await.unwrap(), [confirmed, web()], "a code skill comes in with confirm on; an llm skill as it was");
         assert_eq!(wos.import_skills(&parsed.to_string(), "f").await.unwrap(), ["add_event", "lookup"], "the parsed form works too");
 
         let m = err_text(wos.import_skills(&text, "d").await);
@@ -1116,6 +1117,14 @@
 
         let bare = client(&e, RouterOptions::default());
         assert!(err_text(bare.import_skills(&text, "h").await).contains(r#"RouterOptions.handlers["add_event"]"#));
+        let off = json!({"wontopos_skills": 1, "skills": [
+            serde_json::to_value(SkillDefinition { confirm: Some(false), ..event() }).unwrap(),
+            serde_json::to_value(SkillDefinition { confirm: Some(false), ..web() }).unwrap(),
+        ]})
+        .to_string();
+        assert_eq!(wos.import_skills(&off, "i").await.unwrap(), ["add_event", "lookup"]);
+        let confirms: Vec<_> = wos.list_skills("i").await.unwrap().into_iter().map(|s| s.confirm).collect();
+        assert_eq!(confirms, [Some(true), Some(false)], "an import cannot bind your function to a skill that runs without asking");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2349,7 +2358,7 @@ For travel times, run scripts/route.py.
         }
         let text = json!({"wontopos_skills": 1, "skills": [llm, code]}).to_string();
         assert_eq!(wos.import_skills(&text, None).await.unwrap(), ["lookup", "add_event"]);
-        assert_eq!(wos.list_skills(None).await.unwrap(), vec![event(), web()]);
+        assert_eq!(wos.list_skills(None).await.unwrap(), vec![SkillDefinition { confirm: Some(true), ..event() }, web()]);
         assert!(!wos.export_skills(None).await.unwrap().contains("null"));
         let mut nameless = serde_json::to_value(web()).unwrap();
         nameless["name"] = Value::Null;

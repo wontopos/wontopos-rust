@@ -46,8 +46,8 @@ async fn main() -> Result<(), WosError> {
 | `update(old_memory_id, new_content, user_id)` | Replace a fact that changed. The old version stays in its history. |
 | `*_idempotent` | The same writes with an idempotency key of your own. |
 | **Read** | |
-| `recall(query, user_id)` · `recall_opts` · `recall_with` | The recent turns, the memories that match and the conversation around the best one, in one call. |
-| `search(query, user_id, limit)` · `search_opts` · `search_with` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). |
+| `recall(query, user_id)` · `recall_opts` · `recall_with` | The recent turns, the memories that match and the conversation around the best one, in one call. From Scroll 2 on, the last three days by part of the day too. |
+| `search(query, user_id, limit)` · `search_opts` · `search_with` | The memories that match, best first. `limit` caps these; the assistant's own words and image memories, when there are any, follow them (with `filters`, the assistant's words are left out). For an LLM's context, use `recall`. |
 | `search_full` · `search_full_with` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self` · `search_self_with` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
@@ -312,7 +312,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Fourteen inside 2.2 were not, deliberately and each with its
+releases are additive. Fifteen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-rust/blob/main/CHANGELOG.md).

@@ -1696,7 +1696,7 @@ impl Client {
             .map_err(|e| refused(format!("the skills cannot be written as JSON ({e}).")))
     }
 
-    /// Add the skills of an [`Client::export_skills`] text to a store, all or none.
+    /// Add the skills of an [`Client::export_skills`] text to a store, all or none. A code skill comes in with `confirm` on.
     pub async fn import_skills(&self, data: &str, user_id: impl Into<Option<&str>>) -> Result<Vec<String>, WosError> {
         let parsed: serde_json::Value =
             serde_json::from_str(data).map_err(|e| refused(format!("the skills are not JSON: {e}")))?;
@@ -1707,11 +1707,14 @@ impl Client {
             )));
         };
         let store = self.uid(user_id.into())?;
-        let defs = list
+        let mut defs = list
             .iter()
             .enumerate()
             .map(|(i, s)| check_skill(s, &self.router).map_err(|e| refused(format!("skills[{i}]: {e} Nothing was imported."))))
             .collect::<Result<Vec<_>, _>>()?;
+        for d in defs.iter_mut().filter(|d| matches!(d.kind, SkillKind::Code)) {
+            d.confirm = Some(true);
+        }
         let mut skills = lock(&self.router.skills);
         let mut names = std::collections::HashSet::new();
         for d in &defs {
