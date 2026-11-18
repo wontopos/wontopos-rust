@@ -1,5 +1,7 @@
 use super::*;
 
+const CAME_FROM_A_LOOK: &str = "memory_id is required (non-blank) — the id a search, recall or work returned.";
+
 fn search_fields(mut obj: serde_json::Map<String, serde_json::Value>, opts: &SearchOpts) -> serde_json::Map<String, serde_json::Value> {
     if let Some(v) = opts.verify {
         obj.insert("verify".into(), serde_json::json!(v));
@@ -49,6 +51,16 @@ impl Client {
         &self, content: &str, user_id: impl Into<Option<&str>>, metadata: serde_json::Value, extra: serde_json::Value,
         idempotency_key: Option<&str>, opts: &WriteOpts,
     ) -> Result<serde_json::Value, WosError> {
+        let kind = match &metadata {
+            serde_json::Value::Object(_) | serde_json::Value::Null => None,
+            serde_json::Value::String(_) => Some("string"),
+            serde_json::Value::Array(_) => Some("an array"),
+            serde_json::Value::Number(_) => Some("number"),
+            serde_json::Value::Bool(_) => Some("boolean"),
+        };
+        if let Some(kind) = kind {
+            return Err(refused(format!("metadata must be an object, got {kind}. Nothing was sent.")));
+        }
         check_metadata_keys(&metadata)?;
         let mut metadata = metadata;
         if let Some(who) = metadata.get("speaker").and_then(|s| s.as_str()).map(|s| written_speaker(s, "speaker")).transpose()? {
@@ -342,7 +354,7 @@ impl Client {
     pub async fn around(&self, memory_id: &str, user_id: impl Into<Option<&str>>, opts: &AroundOpts) -> Result<serde_json::Value, WosError> {
         let mut obj = serde_json::Map::new();
         obj.insert("user_id".into(), serde_json::json!(self.uid(user_id.into())?));
-        obj.insert("memory_id".into(), serde_json::json!(check_id(memory_id, "memory_id")?));
+        obj.insert("memory_id".into(), serde_json::json!(nonblank(memory_id, CAME_FROM_A_LOOK)?));
         for (k, v) in [("from", opts.from), ("to", opts.to), ("center", opts.center)] {
             if let Some(v) = v {
                 obj.insert(k.into(), serde_json::json!(check_range(k, v, -200, 200)?));
@@ -360,7 +372,7 @@ impl Client {
     /// How a memory was reached, when it answered a work of three steps or more.
     pub async fn why(&self, memory_id: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        let memory_id = check_id(memory_id, "memory_id")?;
+        let memory_id = nonblank(memory_id, CAME_FROM_A_LOOK)?.to_string();
         self.post("/api/v1/memory/why", serde_json::json!({"user_id": user_id, "memory_id": memory_id})).await
     }
 
@@ -412,7 +424,11 @@ impl Client {
 
     /// Fetch one memory by id. An unknown id is a 404 ([`ErrorKind::NotFound`]).
     pub async fn get(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
-        let memory_id = nonblank(memory_id, "memory_id is required — the id that add/store or list_memories returned.")?;
+        let memory_id = nonblank(
+            memory_id,
+            "memory_id is required — the id that add/store or list_memories returned. Note the argument order: \
+             get(user_id, memory_id). With a store set on the client, call get(None, memory_id).",
+        )?;
         let user_id = self.uid(user_id.into())?;
         let v = self.post("/api/v1/memory/get", serde_json::json!({"user_id": user_id, "memory_id": memory_id})).await?;
         Ok(memory_from_get(v))
@@ -460,7 +476,7 @@ impl Client {
 
     /// The edits that followed one memory, oldest first.
     pub async fn lineage(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
-        let memory_id = nonblank(memory_id, "memory_id is required — the id that add/store or list_memories returned.")?;
+        let memory_id = nonblank(memory_id, "memory_id is required (non-blank) — the id that add/store or list_memories returned.")?;
         let user_id = self.uid(user_id.into())?;
         let v = self.post("/api/v1/memory/lineage", serde_json::json!({ "user_id": user_id, "memory_id": memory_id })).await?;
         Ok(with_lists(v, &["chain"]))
@@ -472,7 +488,7 @@ impl Client {
         skip_ids: Option<&[String]>,
     ) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        let speaker = nonblank(speaker, "speaker is required — \"me\" for the assistant, or a person's name")?;
+        let speaker = nonblank(speaker, "speaker is required — \"me\" for the assistant, or a person's name.")?;
         let mut body = serde_json::json!({ "user_id": user_id, "speaker": speaker });
         page_fields(&mut body, limit.into(), before.into(), skip_ids)?;
         Ok(with_lists(self.post("/api/v1/memory/by-speaker", body).await?, &["memories"]))
@@ -547,7 +563,7 @@ impl Client {
 
     /// Delete a store and all its memories.
     pub async fn delete_store(&self, user_id: &str) -> Result<serde_json::Value, WosError> {
-        nonblank(user_id, "user_id is required (non-blank) — delete_store never falls back to the default store.")?;
+        nonblank(user_id, "user_id is required (a non-blank string) — delete_store never falls back to the default store.")?;
         warn_if_store_id_collapses(user_id);
         let body = serde_json::json!({ "user_id": user_id });
         self.request(reqwest::Method::DELETE, "/api/v1/memory/collection", Some(&body), None).await
@@ -555,7 +571,11 @@ impl Client {
 
     /// Delete one memory by id.
     pub async fn delete(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<serde_json::Value, WosError> {
-        let memory_id = nonblank(memory_id, "memory_id is required (non-blank). To delete every memory in a store, call delete_all(user_id) explicitly.")?;
+        let memory_id = nonblank(
+            memory_id,
+            "memory_id is required (non-blank). To delete every memory in a store, call delete_all(user_id) explicitly. \
+             Note the argument order: delete(user_id, memory_id).",
+        )?;
         let user_id = self.uid(user_id.into())?;
         self.post("/api/v1/memory/forget", serde_json::json!({"user_id": user_id, "memory_id": memory_id})).await
     }
@@ -563,7 +583,7 @@ impl Client {
     /// Delete all memories in a store; it also clears the store's time zone and speakers.
     /// On Scroll 2, set them again with [`Client::set_settings`] and [`Client::add_speaker`] before the next write.
     pub async fn delete_all(&self, user_id: &str) -> Result<serde_json::Value, WosError> {
-        nonblank(user_id, "user_id is required (non-blank) for delete_all — a blank/whitespace id would wipe the default store.")?;
+        nonblank(user_id, "user_id is required (a non-blank string) for delete_all — anything else would wipe the default store.")?;
         warn_if_store_id_collapses(user_id);
         self.post("/api/v1/memory/forget", serde_json::json!({"user_id": user_id})).await
     }
@@ -578,10 +598,10 @@ pub(crate) fn memory_page(v: serde_json::Value) -> serde_json::Value {
     let mut v = with_lists(v, &["memories"]);
     if let Some(o) = v.as_object_mut() {
         let n = o.get("memories").and_then(|m| m.as_array()).map_or(0, Vec::len);
-        if !o.get("count").map_or(false, serde_json::Value::is_number) {
+        if !o.get("count").is_some_and(serde_json::Value::is_number) {
             o.insert("count".into(), serde_json::json!(n));
         }
-        if o.get("next_cursor").map_or(true, |c| c.is_null() || c.as_str() == Some("")) {
+        if o.get("next_cursor").is_none_or(|c| c.is_null() || c.as_str() == Some("")) {
             o.insert("next_cursor".into(), serde_json::Value::Null);
         }
     }

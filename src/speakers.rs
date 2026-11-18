@@ -19,7 +19,7 @@ impl Client {
     /// Unregister a person; their memories stay.
     pub async fn remove_speaker(&self, speaker: &str, user_id: impl Into<Option<&str>>) -> Result<serde_json::Value, WosError> {
         let user_id = self.uid(user_id.into())?;
-        let body = serde_json::json!({"user_id": user_id, "speaker": check_id(speaker, "speaker")?});
+        let body = serde_json::json!({"user_id": user_id, "speaker": speaker_arg(speaker, "speaker")?});
         self.request(reqwest::Method::DELETE, "/api/v1/memory/speakers", Some(&body), None).await
     }
 
@@ -29,11 +29,15 @@ impl Client {
     ) -> Result<serde_json::Value, WosError> {
         let mut obj = serde_json::Map::new();
         obj.insert("user_id".into(), serde_json::json!(self.uid(user_id.into())?));
-        obj.insert("from".into(), serde_json::json!(check_id(from_speaker, "from_speaker")?));
+        obj.insert("from".into(), serde_json::json!(speaker_arg(from_speaker, "from_speaker")?));
         obj.insert("to".into(), serde_json::json!(written_speaker(to_speaker, "to_speaker")?));
         if let Some(ids) = memory_ids {
             if !(1..=1000).contains(&ids.len()) {
-                return Err(refused(format!("memory_ids must hold between 1 and 1000 ids, got {}.", ids.len())));
+                return Err(refused(format!(
+                    "memory_ids must be a list of 1 to 1000 memory ids, got {} ids. Leave it out to relabel every memory \
+                     under from_speaker.",
+                    ids.len()
+                )));
             }
             let ids = ids.iter().enumerate().map(|(i, m)| check_id(m, &format!("memory_ids[{i}]"))).collect::<Result<Vec<_>, _>>()?;
             obj.insert("memory_ids".into(), serde_json::json!(ids));
@@ -45,14 +49,18 @@ impl Client {
     pub async fn forget_speaker(
         &self, speakers: impl IntoIterator<Item = impl AsRef<str>>, user_id: &str, preview: bool,
     ) -> Result<serde_json::Value, WosError> {
-        nonblank(user_id, "user_id is required (non-blank) for forget_speaker — it never falls back to the default store.")?;
+        nonblank(
+            user_id,
+            "user_id is required (a non-blank string) for forget_speaker: it deletes everything that person said in the \
+             store, so it never falls back to the default store.",
+        )?;
         warn_if_store_id_collapses(user_id);
         let mut names = Vec::new();
         for (i, s) in speakers.into_iter().enumerate() {
-            names.push(check_id(s.as_ref(), &format!("speakers[{i}]"))?);
+            names.push(speaker_arg(s.as_ref(), &format!("speakers[{i}]"))?);
         }
         if names.is_empty() {
-            return Err(refused("forget_speaker needs at least one speaker name."));
+            return Err(refused("speakers is required: a list of at least one name."));
         }
         let mut body = serde_json::json!({"user_id": user_id, "speakers": names});
         if preview {
@@ -94,7 +102,7 @@ impl Client {
             obj.insert("default_speakers".into(), serde_json::Value::Object(sides));
         }
         if !obj.contains_key("time_zone") && !obj.contains_key("default_speakers") {
-            return Err(refused("set_settings needs time_zone or default_speakers: there is nothing to change."));
+            return Err(refused("set_settings needs time_zone, default_speakers or both."));
         }
         if let Some(c) = opts.confirmed_by_user {
             obj.insert("confirmed_by_user".into(), serde_json::json!(c));

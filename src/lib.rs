@@ -489,12 +489,12 @@ impl Client {
     }
 
     fn uid(&self, user_id: Option<&str>) -> Result<String, WosError> {
-        if matches!(user_id, Some(u) if js_trim(u).is_empty()) {
-            return Err(refused(
-                "user_id was passed but is blank. Omit it to use the client's default \
-                 store, or pass a real store id — a blank id would silently write into \
-                 a different store.",
-            ));
+        if let Some(u) = user_id.filter(|u| js_trim(u).is_empty()) {
+            return Err(refused(format!(
+                "user_id must be a non-blank string; got {}. Omit it to use the client's default store, or pass a real \
+                 store id — anything else would silently write into the default store.",
+                js_quote(u)
+            )));
         }
         let sid = user_id.map_or_else(|| self.default_user.clone(), str::to_string);
         if js_trim(&sid).is_empty() {
@@ -1318,6 +1318,7 @@ fn js_json(v: &serde_json::Value) -> String {
 #[cfg(test)] mod speaker_line_tests;
 #[cfg(test)] mod hunt_transport_tests;
 #[cfg(test)] mod hunt_api_tests;
+#[cfg(test)] mod parity_refusals_tests;
 #[cfg(test)] mod hunt_tools_tests;
 #[cfg(test)] mod hunt_router_tests;
 #[cfg(test)] mod hunt_packaging_tests;

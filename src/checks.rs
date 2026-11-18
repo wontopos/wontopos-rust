@@ -256,15 +256,21 @@ pub(crate) fn turn_fields(obj: &mut serde_json::Map<String, serde_json::Value>, 
     Ok(())
 }
 
-pub(crate) fn check_speaker(v: &str, name: &str) -> Result<String, WosError> {
+/// A speaker's name an argument gives, trimmed; the refusal Python and TypeScript give too.
+pub(crate) fn speaker_arg(v: &str, name: &str) -> Result<String, WosError> {
     let t = js_trim(v);
     if t.is_empty() {
-        return Err(refused(format!("{name} is required.")));
+        return Err(refused(format!("{name} must be a speaker's name (a non-blank string), got {}.", js_quote(v))));
     }
+    Ok(t.to_string())
+}
+
+pub(crate) fn check_speaker(v: &str, name: &str) -> Result<String, WosError> {
+    let t = speaker_arg(v, name)?;
     if t.len() > SPEAKER_MAX_BYTES {
         return Err(refused(format!("{name} is at most {SPEAKER_MAX_BYTES} bytes.")));
     }
-    Ok(t.to_string())
+    Ok(t)
 }
 
 pub(crate) fn written_speaker(v: &str, name: &str) -> Result<String, WosError> {
@@ -316,9 +322,9 @@ pub(crate) fn check_instant(v: &str, name: &str) -> Result<String, WosError> {
     let t = check_id(v, name)?;
     if !rfc3339_shaped(&t) || chrono::DateTime::parse_from_rfc3339(&t).is_err() {
         return Err(refused(format!(
-            "{name} must be RFC3339 with an offset (2024-03-01T10:00:00Z or 2024-03-01T19:00:00+09:00), \
-             with a T between date and time; a plain date or a time with no offset is refused, and so is \
-             a space for the T, got {t:?}."
+            "{name} must be an RFC 3339 time with Z or a ±hh:mm offset, such as 2026-05-02T09:00:00Z \
+             (a date alone, a time with no offset, and a space or a small t in place of the T are refused), got {}.",
+            js_quote(&t)
         )));
     }
     Ok(t)

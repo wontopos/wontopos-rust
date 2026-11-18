@@ -144,7 +144,7 @@
         let (base, seen) = scripted(vec![]);
         let mem = Client::with_base_url(KEY, &base);
         for (md, want) in [
-            (json!({"speaker": "  "}), "speaker is required."),
+            (json!({"speaker": "  "}), "speaker must be a speaker's name (a non-blank string), got \"  \"."),
             (json!({"speaker": "A".repeat(257)}), "speaker is at most 256 bytes."),
         ] {
             assert_eq!(refusal(mem.add("x", "u", md).await), want);
@@ -161,9 +161,9 @@
     async fn add_and_remove_speaker_trim_the_name_and_refuse_a_blank_one() {
         let (base, seen) = scripted(vec![]);
         let mem = Client::with_base_url(KEY, &base);
-        assert_eq!(refusal(mem.add_speaker("  ", "u").await), "speaker is required.");
+        assert_eq!(refusal(mem.add_speaker("  ", "u").await), "speaker must be a speaker's name (a non-blank string), got \"  \".");
         assert_eq!(refusal(mem.add_speaker(&"A".repeat(257), "u").await), "speaker is at most 256 bytes.");
-        assert_eq!(refusal(mem.remove_speaker("  ", "u").await), "speaker is required.");
+        assert_eq!(refusal(mem.remove_speaker("  ", "u").await), "speaker must be a speaker's name (a non-blank string), got \"  \".");
         assert_eq!(count(&seen), 0);
         mem.add_speaker(" Ana ", "u").await.unwrap();
         mem.remove_speaker(" Ana ", "u").await.unwrap();

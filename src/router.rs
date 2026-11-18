@@ -2376,7 +2376,7 @@ fn quoted<'a>(v: &'a str, place: &str) -> Result<&'a str, String> {
     let kind = if q == b'"' { "double" } else { "single" };
     let end = end.ok_or_else(|| format!("{place}: a {kind}-quoted value has no closing quote."))?;
     let rest = &v[end + 1..];
-    if !rest.is_empty() && !(rest.chars().next().is_some_and(js_space) && js_trim(rest).starts_with('#')) {
+    if !rest.is_empty() && (!rest.chars().next().is_some_and(js_space) || !js_trim(rest).starts_with('#')) {
         return Err(format!("{place}: only a comment can follow the closing quote."));
     }
     Ok(&v[..=end])

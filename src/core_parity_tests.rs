@@ -29,7 +29,7 @@
         for (m, want) in [
             (refusal(mem.get("u", "\u{feff}").await), "memory_id is required"),
             (refusal(mem.seen("\u{feff}", "u").await), "at is required"),
-            (refusal(mem.stats("\u{feff}").await), "user_id was passed but is blank"),
+            (refusal(mem.stats("\u{feff}").await), "user_id must be a non-blank string"),
             (refusal(mem.delete_store(" \u{feff}").await), "user_id is required"),
             (refusal(mem.forget_speaker(["Dana"], "\u{feff}", false).await), "user_id is required"),
         ] {

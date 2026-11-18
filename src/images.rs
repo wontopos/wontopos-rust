@@ -3,7 +3,7 @@ use super::*;
 impl Client {
     /// Fetch the bytes of an image memory.
     pub async fn get_image(&self, user_id: impl Into<Option<&str>>, memory_id: &str) -> Result<(Vec<u8>, String), WosError> {
-        let memory_id = nonblank(memory_id, "memory_id is required — the id that add/store or list_images returned.")?;
+        let memory_id = nonblank(memory_id, "memory_id is required (non-blank) — the id that add/store or list_images returned.")?;
         let user_id = self.uid(user_id.into())?;
         let body = serde_json::json!({ "user_id": user_id, "memory_id": memory_id });
         self.request_bytes("/api/v1/memory/image", &body).await
@@ -11,7 +11,7 @@ impl Client {
 
     /// Remove the photo from a memory; it can take the whole memory with it.
     pub async fn forget_image(&self, user_id: impl Into<Option<&str>>, memory_id: &str, preview: bool) -> Result<serde_json::Value, WosError> {
-        let memory_id = nonblank(memory_id, "memory_id is required — the id of the memory whose image you want removed.")?;
+        let memory_id = nonblank(memory_id, "memory_id is required (non-blank) — the id of the memory whose image you want removed.")?;
         let user_id = self.uid(user_id.into())?;
         let mut body = serde_json::json!({ "user_id": user_id, "memory_id": memory_id });
         if preview {

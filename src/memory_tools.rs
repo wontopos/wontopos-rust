@@ -946,7 +946,7 @@ fn usage_text(u: &serde_json::Value) -> String {
     };
     let mut lines = vec![format!("This week's plan usage: {} used, {} left.", percent(used), percent(1000 - used))];
     let days = week.get("days").and_then(|d| d.as_array());
-    if let Some(today) = days.and_then(|d| d.iter().filter(|x| x.is_object()).last()) {
+    if let Some(today) = days.and_then(|d| d.iter().rfind(|x| x.is_object())) {
         let day = today.get("day").and_then(|d| d.as_str()).filter(|d| is_day(d));
         if let (Some(day), Some(share)) = (day, tenths(today.get("used_percent"))) {
             lines.push(format!("Today ({day}, UTC) used {} of the week.", percent(share)));

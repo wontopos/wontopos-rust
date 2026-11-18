@@ -432,8 +432,9 @@ impl Client {
         }
         if let Some(bad) = self.api_key.chars().find(|c| !c.is_ascii()) {
             return Err(refused(format!(
-                "api_key contains a non-ASCII character ({bad:?}) - rich text turns '-' into an \
-                 en dash; copy the key from a plain-text field"
+                "api_key contains a non-ASCII character ({}) - rich text turns '-' into an \
+                 en dash; copy the key from a plain-text field",
+                js_quote(&bad.to_string())
             )));
         }
         if self.api_key.starts_with("sk-") {

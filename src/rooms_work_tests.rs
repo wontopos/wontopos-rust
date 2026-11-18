@@ -794,7 +794,7 @@
 
         let tools = || client("http://127.0.0.1:9").memory_tools("u", None).unwrap();
         for (name, want) in [
-            (" ".to_string(), "assistant is required"),
+            (" ".to_string(), "assistant must be a speaker's name"),
             ("é".repeat(129), "assistant is at most 256 bytes"),
             ("Ka\u{7}i".to_string(), "assistant contains a line break or a control character"),
             ("Ka\u{85}i".to_string(), "assistant contains a line break or a control character"),

@@ -47,6 +47,12 @@
         let mem = Client::with_base_url("wos-test\u{85}xxxxxxxxxx", &base).with_retries(0);
         let said = refusal(mem.stats("u").await);
         assert!(said.starts_with("api_key contains a non-ASCII character ("), "{said}");
+        // The character in double quotes, as Python and TypeScript show it.
+        let mem = Client::with_base_url("wos-test\u{2013}xxxxxxxxxx", &base).with_retries(0);
+        assert_eq!(
+            refusal(mem.stats("u").await),
+            "api_key contains a non-ASCII character (\"\u{2013}\") - rich text turns '-' into an en dash; copy the key from a plain-text field"
+        );
         assert_eq!(count(&seen), 0);
     }
 

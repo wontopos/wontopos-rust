@@ -136,8 +136,8 @@
         let mem = Client::with_base_url(KEY, &base);
         let blank = DefaultSpeakers { assistant: Some(Some(" ".into())), ..Default::default() };
         for (o, want) in [
-            (SettingsOpts::default(), "needs time_zone or default_speakers"),
-            (SettingsOpts { confirmed_by_user: Some(true), ..Default::default() }, "needs time_zone or default_speakers"),
+            (SettingsOpts::default(), "needs time_zone, default_speakers or both"),
+            (SettingsOpts { confirmed_by_user: Some(true), ..Default::default() }, "needs time_zone, default_speakers or both"),
             (
                 SettingsOpts { default_speakers: Some(DefaultSpeakers::default()), ..Default::default() },
                 "default_speakers must name user, assistant or both",
@@ -207,10 +207,10 @@
         let none: Vec<String> = Vec::new();
         let many: Vec<String> = (0..1001).map(|i| i.to_string()).collect();
         for (m, want) in [
-            (refusal(mem.relabel_speaker(" ", "Anna", "u", None).await), "from_speaker is required"),
-            (refusal(mem.relabel_speaker("Ana", "", "u", None).await), "to_speaker is required"),
-            (refusal(mem.relabel_speaker("Ana", "Anna", "u", Some(&none)).await), "between 1 and 1000 ids, got 0"),
-            (refusal(mem.relabel_speaker("Ana", "Anna", "u", Some(&many)).await), "between 1 and 1000 ids, got 1001"),
+            (refusal(mem.relabel_speaker(" ", "Anna", "u", None).await), "from_speaker must be a speaker's name"),
+            (refusal(mem.relabel_speaker("Ana", "", "u", None).await), "to_speaker must be a speaker's name"),
+            (refusal(mem.relabel_speaker("Ana", "Anna", "u", Some(&none)).await), "1 to 1000 memory ids, got 0 ids"),
+            (refusal(mem.relabel_speaker("Ana", "Anna", "u", Some(&many)).await), "1 to 1000 memory ids, got 1001 ids"),
         ] {
             assert!(m.contains(want), "want {want:?}, got {m}");
         }
@@ -245,9 +245,9 @@
         let mem = Client::with_base_url(KEY, &base).with_user("alice");
         let nobody: [&str; 0] = [];
         for (m, want) in [
-            (refusal(mem.forget_speaker(["Ana"], " ", false).await), "user_id is required (non-blank) for forget_speaker"),
-            (refusal(mem.forget_speaker(nobody, "u", false).await), "needs at least one speaker name"),
-            (refusal(mem.forget_speaker(["Ana", "  "], "u", true).await), "speakers[1] is required"),
+            (refusal(mem.forget_speaker(["Ana"], " ", false).await), "user_id is required (a non-blank string) for forget_speaker"),
+            (refusal(mem.forget_speaker(nobody, "u", false).await), "a list of at least one name"),
+            (refusal(mem.forget_speaker(["Ana", "  "], "u", true).await), "speakers[1] must be a speaker's name"),
         ] {
             assert!(m.contains(want), "want {want:?}, got {m}");
         }
@@ -290,11 +290,11 @@
             (refusal(mem.set_settings("u", &nel).await), "default_speakers.assistant contains a line break or a control character."),
             (refusal(mem.relabel_speaker("Dana", "Kai\u{85}", "u", None).await), "to_speaker contains a line break or a control character."),
             (refusal(mem.set_settings("u", &bom).await), "default_speakers.user must be a name"),
-            (refusal(mem.relabel_speaker("\u{feff}", "Kai", "u", None).await), "from_speaker is required"),
-            (refusal(mem.relabel_speaker("Dana", " \u{feff}", "u", None).await), "to_speaker is required"),
-            (refusal(mem.forget_speaker(["Dana", "\u{feff}"], "u", true).await), "speakers[1] is required"),
+            (refusal(mem.relabel_speaker("\u{feff}", "Kai", "u", None).await), "from_speaker must be a speaker's name"),
+            (refusal(mem.relabel_speaker("Dana", " \u{feff}", "u", None).await), "to_speaker must be a speaker's name"),
+            (refusal(mem.forget_speaker(["Dana", "\u{feff}"], "u", true).await), "speakers[1] must be a speaker's name"),
             (refusal(mem.by_speaker("\u{feff}", "u", None, None, None).await), "speaker is required"),
-            (refusal(mem.add_turn_opts("q", "a", "u", &late).await), "created_at must be RFC3339"),
+            (refusal(mem.add_turn_opts("q", "a", "u", &late).await), "created_at must be an RFC 3339 time"),
         ] {
             assert!(m.contains(want), "want {want:?}, got {m}");
         }
@@ -463,11 +463,11 @@
         mem.add_bulk_opts("x", "u", "notes", &blank).await.unwrap();
         let long = "a".repeat(257);
         for (m, want) in [
-            (refusal(mem.add_bulk_opts(None, "u", "chat", &segments(vec![segment("x", Some(" "), None)])).await), "segments[0].speaker is required"),
+            (refusal(mem.add_bulk_opts(None, "u", "chat", &segments(vec![segment("x", Some(" "), None)])).await), "segments[0].speaker must be a speaker's name"),
             (refusal(mem.add_bulk_opts(None, "u", "chat", &segments(vec![segment("x", Some(&long), None)])).await), "at most 256 bytes"),
             (
                 refusal(mem.add_bulk_opts("x", "u", "chat", &BulkOpts { speaker: Some("".into()), ..Default::default() }).await),
-                "speaker is required",
+                "speaker must be a speaker's name",
             ),
         ] {
             assert!(m.contains(want), "want {want:?}, got {m}");
@@ -518,24 +518,24 @@
             o
         };
         for (o, want) in [
-            (opts(|o| o.user_speaker = Some("  ".into())), "user_speaker is required"),
+            (opts(|o| o.user_speaker = Some("  ".into())), "user_speaker must be a speaker's name"),
             (opts(|o| o.assistant_speaker = Some("é".repeat(129))), "assistant_speaker is at most 256 bytes"),
             (opts(|o| o.created_at = Some("".into())), "created_at is required"),
-            (opts(|o| o.created_at = Some("yesterday".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-02-30".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01T25:00:00Z".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01".into())), "a plain date or a time with no offset is refused"),
-            (opts(|o| o.created_at = Some(" 2024-03-01 ".into())), "created_at must be RFC3339 with an offset"),
-            (opts(|o| o.created_at = Some("2024-03-01T10:00:00".into())), "created_at must be RFC3339 with an offset"),
-            (opts(|o| o.created_at = Some("2024-03-01T10:00".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01 10:00:00+00:00".into())), "a space for the T"),
-            (opts(|o| o.created_at = Some("2024-03-01 10:00:00Z".into())), "a space for the T"),
-            (opts(|o| o.created_at = Some("2024-03-01t10:00:00Z".into())), "with a T between date and time"),
-            (opts(|o| o.created_at = Some("2024-03-01T10:00:00z".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01T23:59:60Z".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01T19:00:00\u{2212}05:00".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("0000-01-01T00:00:00Z".into())), "created_at must be RFC3339"),
-            (opts(|o| o.created_at = Some("2024-03-01T10:00:00+24:00".into())), "created_at must be RFC3339"),
+            (opts(|o| o.created_at = Some("yesterday".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-02-30".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T25:00:00Z".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01".into())), "a date alone, a time with no offset"),
+            (opts(|o| o.created_at = Some(" 2024-03-01 ".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T10:00:00".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T10:00".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01 10:00:00+00:00".into())), "a space or a small t in place of the T"),
+            (opts(|o| o.created_at = Some("2024-03-01 10:00:00Z".into())), "a space or a small t in place of the T"),
+            (opts(|o| o.created_at = Some("2024-03-01t10:00:00Z".into())), "a space or a small t in place of the T"),
+            (opts(|o| o.created_at = Some("2024-03-01T10:00:00z".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T23:59:60Z".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T19:00:00\u{2212}05:00".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("0000-01-01T00:00:00Z".into())), "created_at must be an RFC 3339 time"),
+            (opts(|o| o.created_at = Some("2024-03-01T10:00:00+24:00".into())), "created_at must be an RFC 3339 time"),
         ] {
             let m = refusal(mem.add_turn_opts("q", "a", "u", &o).await);
             assert!(m.contains(want), "want {want:?}, got {m}");

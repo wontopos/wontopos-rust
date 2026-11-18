@@ -34,7 +34,7 @@ async fn add_refuses_a_created_at_that_is_not_an_instant() {
         let o = WriteOpts { created_at: Some(bad.into()), ..Default::default() };
         assert!(refusal(mem.add_opts("x", "u", json!({}), &o).await).contains("created_at"), "{bad}");
     }
-    assert!(refusal(mem.add("x", "u", json!({"created_at": "2024-03-01"})).await).contains("created_at must be RFC3339"));
+    assert!(refusal(mem.add("x", "u", json!({"created_at": "2024-03-01"})).await).contains("created_at must be an RFC 3339 time"));
     assert!(refusal(mem.add("x", "u", json!({"created_at": 5})).await).contains("created_at"));
     assert_eq!(count(&seen), 0);
 }

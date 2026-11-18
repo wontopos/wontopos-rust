@@ -9,7 +9,7 @@
                 WosError::Api { status, ref message, .. } => {
                     assert_eq!(status, 400, "client-side rejection uses 400, got {status}");
                     assert!(
-                        message.contains("passed but is blank"),
+                        message.contains("must be a non-blank string"),
                         "message should name the actual mistake, got: {message}"
                     );
                 }
