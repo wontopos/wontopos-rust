@@ -738,7 +738,7 @@
                 "09:12 [02] We agreed to keep the width at 400. (said at least 2 times, first on 2024-08-14)",
                 "2024-08-21",
                 "14:06 [01] The final width for the gate is 450.",
-                "      [03] Width reminders are on. (corrected later)",
+                "14:06 [03] Width reminders are on. (corrected later)",
             ]
             .join("\n")
         );
@@ -1289,10 +1289,10 @@
                 "2024-08-15",
                 "[04] user: Moved to Porto.",
                 "09:12 [03] you: Setting the width at 400 involves…",
-                "      [02] user: We agreed to keep the width at 400.",
+                "09:12 [02] user: We agreed to keep the width at 400.",
                 "2024-08-21",
                 "14:06 [01] you: The final width for the gate is 450.",
-                "      [05] user: Width reminders are on. (corrected later)",
+                "14:06 [05] user: Width reminders are on. (corrected later)",
             ]
             .join("\n")
         );
@@ -1526,6 +1526,11 @@
             let args = format!(r#"{{"query": "x", "n": {n}}}"#);
             assert_eq!(mem.run_arguments("memory_search", &args).await.unwrap(), "Refused: the arguments are not JSON.", "{n}");
         }
+        let nested = |levels: usize| (1..levels).fold(json!({}), |v, _| json!({"a": v}));
+        let at_128 = json!({"query": " ", "n": nested(127)});
+        assert_eq!(mem.run("memory_search", &at_128).await.unwrap(), "Refused: the arguments are not JSON.");
+        let at_127 = json!({"query": " ", "n": nested(126)});
+        assert_eq!(mem.run("memory_search", &at_127).await.unwrap(), "Refused: query is required.");
         let wrong = mem.run("search", &json!({})).await.unwrap_err().to_string();
         assert!(wrong.contains(r#"not a memory tool: "search""#), "{wrong}");
         assert!(mem.run_arguments("search", "{oops").await.is_err(), "the name is checked first");
@@ -1694,7 +1699,7 @@
         .collect();
         assert_eq!(
             said_lines(&lines),
-            "2024-08-15\n00:12 +0 user: \n+1 user: \n      +2 user: \n2024-08-16\n00:12 +3 user: \n(no date)\n+4 user: "
+            "2024-08-15\n00:12 +0 user: \n+1 user: \n00:12 +2 user: \n2024-08-16\n00:12 +3 user: \n(no date)\n+4 user: "
         );
         for (s, want) in [
             ("2026-09-30T04:00:00Z", Some(1_790_740_800_000)),

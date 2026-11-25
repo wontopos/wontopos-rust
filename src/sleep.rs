@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 /// The version of the sleep's texts, steps and rules.
-pub const SLEEP_VERSION: &str = "1.0.2";
+pub const SLEEP_VERSION: &str = "1.0.3";
 
 const SLEEP_DIGEST: &str = r#"You are the sleep of {being}. While {being} sleeps, you read part {k} of {n} of what happened
 since its last sleep. Almost all of it will be let go: every line stays in long-term memory, where a
@@ -214,8 +214,9 @@ Answer with JSON only: {{"drop": [<the numbers of the lines to take out; none, m
 
 const SLEEP_ROOM: &str = r#"You are the sleep of {being}. Tonight's changes left its {where} at {used:,} tokens, over its cap
 of {cap:,}: there is no room. Make room until it is at most {cap:,} tokens: fold sections into fewer
-lines, leave out what a search gives back{core_way}. Keep what tonight added that matters, and keep
-{being}'s voice.
+lines and leave out what a search gives back. Every section stays under its own heading, with at
+least one line{core_way}: an answer that leaves a section out is not used. Keep what tonight added
+that matters, and keep {being}'s voice.
 
 Answer with JSON only: {{"text": "<the whole file, with its ## sections>"{moved}}}"#;
 
@@ -259,6 +260,10 @@ const SLEEP_MIN_EVIDENCE: usize = 2;
 const SLEEP_FOLD_LINES: usize = 4;
 const SLEEP_LINE_TOKENS: u64 = 90;
 const SLEEP_DOUBT_TOKENS: u64 = 25;
+const SLEEP_AFTER_ASKS: usize = 100;
+const SLEEP_WRITE_REFUSALS: usize = 10;
+const SLEEP_SPLIT_DEPTH: usize = 2;
+const SLEEP_ASKED_OUT: &str = "the sleep puts at most 100 questions to the model to settle, tidy and fold after the merge";
 const SLEEP_OVERTURN: usize = 1;
 const SLEEP_MIX_KINDS: [&str; 3] = ["echo", "planted", "speaker"];
 const SLEEP_MIN_PART: u64 = 50_000;
@@ -994,6 +999,93 @@ fn sleep_shown(text: &str) -> String {
     sleep_untagged(&sleep_folded(text, breaks, "\n    "))
 }
 
+/// The sections of the core a room's "moved" takes to a box, as (box, index of the section). A move names one
+/// section: the only one of that exact name, else the only one the model was shown under it. A name two sections
+/// answer to moves neither of them, and `Me`, a move with no name, and a section whose name a box cannot keep (`#`)
+/// stay where they are.
+fn sleep_room_moves(held: &[(String, String)], moved: Option<&Value>) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for mv in listed(moved) {
+        let to = text_of(mv.get("to").unwrap_or(&Value::Null));
+        if !mv.is_object() || !["1", "2", "3", "4"].contains(&to.as_str()) {
+            continue;
+        }
+        let section = text_or_empty(mv.get("section"));
+        let name = sleep_heading(&section);
+        if name.is_empty() {
+            continue;
+        }
+        let mut at: Vec<usize> = (0..held.len()).filter(|j| held[*j].0 == name).collect();
+        if at.is_empty() {
+            at = (0..held.len()).filter(|j| sleep_seen_as(&held[*j].0) == name).collect();
+        }
+        if at.len() != 1 || out.iter().any(|(_, j)| *j == at[0]) {
+            continue;
+        }
+        let h = held[at[0]].0.as_str();
+        if h != SLEEP_ME && sleep_heading(h) == h {
+            out.push((to.parse().unwrap_or(1), at[0]));
+        }
+    }
+    out
+}
+
+/// Which section of the file each section of a room's answer is, and the sections it leaves in doubt. A section of
+/// the file answers to its own name when the answer has that heading, else to the heading the model was shown for
+/// it; one that moved answers to none. The answer's sections of one heading stand, in order, for the file's
+/// sections that answer to it, in the file's order. When the answer has fewer than the file, which ones it kept
+/// cannot be told: it is paired from the top (in the core `Me` first, whose text is not the answer's to write), and
+/// every one of them is in doubt.
+fn sleep_room_pairs(held: &[(String, String)], given: &[(String, String)], moved_at: &[usize], core: bool) -> (Vec<Option<usize>>, Vec<usize>) {
+    let mut out: Vec<Option<usize>> = vec![None; given.len()];
+    let mut asked: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (i, (name, _)) in given.iter().enumerate() {
+        if name.is_empty() {
+            continue;
+        }
+        match asked.iter_mut().find(|(known, _)| *known == name.as_str()) {
+            Some((_, at)) => at.push(i),
+            None => asked.push((name.as_str(), vec![i])),
+        }
+    }
+    let answers_to: Vec<Option<String>> = held
+        .iter()
+        .enumerate()
+        .map(|(j, (h, _))| {
+            if h.is_empty() || moved_at.contains(&j) {
+                None
+            } else if asked.iter().any(|(known, _)| *known == h.as_str()) {
+                Some(h.clone())
+            } else {
+                Some(sleep_seen_as(h))
+            }
+        })
+        .collect();
+    let mut doubt: Vec<usize> = Vec::new();
+    for (name, at) in asked {
+        let mut group: Vec<usize> = (0..held.len()).filter(|j| answers_to[*j].as_deref() == Some(name)).collect();
+        if at.len() < group.len() {
+            doubt.extend(group.iter().copied());
+            let is_me = |j: &usize| core && held[*j].0 == SLEEP_ME;
+            let mut first: Vec<usize> = group.iter().copied().filter(is_me).collect();
+            first.extend(group.iter().copied().filter(|j| !is_me(j)));
+            first.truncate(at.len());
+            first.sort_unstable();
+            group = first;
+        }
+        for (i, j) in at.into_iter().zip(group) {
+            out[i] = Some(j);
+        }
+    }
+    (out, doubt)
+}
+
+/// A heading as the model is shown it: `sleep_kept` turns a rare line break into a new line and guards the
+/// sleep's own tags.
+fn sleep_seen_as(name: &str) -> String {
+    sleep_heading(sleep_kept(name).split('\n').next().unwrap_or("")).to_string()
+}
+
 fn sleep_kept(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -1027,7 +1119,11 @@ fn sleep_lines(mems: &[Line]) -> String {
 }
 
 fn sleep_heading(text: &str) -> &str {
-    strip(strip(text).trim_start_matches('#'))
+    let mut h = strip(text);
+    while h.starts_with('#') {
+        h = strip(h.trim_start_matches('#'));
+    }
+    h
 }
 
 fn sleep_heading_broken(e: &Map<String, Value>, op: &str) -> bool {
@@ -1110,7 +1206,8 @@ fn sleep_sections(body: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, Vec<&str>)> = Vec::new();
     for ln in body.split('\n') {
         if let Some(h) = ln.strip_prefix("## ") {
-            out.push((strip(h).to_string(), Vec::new()));
+            let name = sleep_heading(h);
+            out.push((if name.is_empty() { strip(h) } else { name }.to_string(), Vec::new()));
         } else if let Some(last) = out.last_mut() {
             last.1.push(ln);
         }
@@ -1174,9 +1271,10 @@ fn sleep_set_section(body: &str, heading: &str, text: &str, raw: bool) -> String
 
 fn sleep_drop_section(body: &str, heading: &str) -> (String, Option<String>) {
     let secs = sleep_sections(body);
-    let gone = secs.iter().find(|(h, _)| h == heading).map(|(_, t)| t.clone());
-    let keep: Vec<(String, String)> = secs.into_iter().filter(|(h, _)| h != heading).collect();
-    (sleep_join(&keep), gone)
+    let gone: Vec<&str> = secs.iter().filter(|(h, _)| h == heading).map(|(_, t)| t.as_str()).collect();
+    let text = if gone.is_empty() { None } else { Some(gone.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n")) };
+    let keep: Vec<(String, String)> = secs.iter().filter(|(h, _)| h != heading).cloned().collect();
+    (sleep_join(&keep), text)
 }
 
 fn sleep_demote(text: &str) -> String {
@@ -1404,7 +1502,7 @@ fn sleep_today(head: &Map<String, Value>) -> String {
 fn sleep_dated(s: &str) -> bool {
     let c: Vec<char> = s.chars().collect();
     let sep = |i: usize| matches!(c.get(i), Some('-' | '.' | '/'));
-    let digits_at = |i: usize| c[i..].iter().take_while(|x| digit(**x).is_some()).count();
+    let digits_at = |i: usize| c[i..].iter().take(4).take_while(|x| digit(**x).is_some()).count();
     fn runs(i: usize, lo: usize, hi: usize, have: usize) -> impl Iterator<Item = usize> {
         (lo..=hi.min(have)).map(move |n| i + n)
     }
@@ -1471,7 +1569,7 @@ fn listed(v: Option<&Value>) -> Vec<Value> {
     }
 }
 
-fn sleep_renumbered(got: &mut Map<String, Value>, part: &[Line], log: &Log, k: usize) {
+fn sleep_renumbered(got: &mut Map<String, Value>, part: &[Line], log: &Log, name: &str) {
     let own: std::collections::HashSet<&str> = part.iter().map(|m| m.eid.as_str()).collect();
     let mut refs: Vec<String> = Vec::new();
     for x in listed(got.get("mixed")) {
@@ -1517,7 +1615,7 @@ fn sleep_renumbered(got: &mut Map<String, Value>, part: &[Line], log: &Log, k: u
             }
         }
     }
-    log.push(json!({"call": format!("read {k}"), "renumbered": true, "part": [part[0].eid, part[part.len() - 1].eid]}));
+    log.push(json!({"call": format!("read {name}"), "renumbered": true, "part": [part[0].eid, part[part.len() - 1].eid]}));
 }
 
 fn sleep_doubt_lines_out(text: &str, drop: Option<&Value>, count: &Count) -> Option<String> {
@@ -1769,10 +1867,12 @@ impl Asker {
         key: &str,
         log: &Log,
         mut seen: impl FnMut(String),
+        mut cut: Option<&mut bool>,
     ) -> Result<Option<Map<String, Value>>, ModelCallError> {
         for attempt in 1..=2 {
             let sent = if attempt == 1 { user.to_string() } else { format!("{user}{SLEEP_NOT_JSON}") };
             let (text, meta) = self.ask(system, &sent).await?;
+            let at_length = meta.get("stop").and_then(Value::as_str) == Some("max_tokens");
             let mut entry = Map::new();
             entry.insert("call".into(), json!(key));
             entry.insert("attempt".into(), json!(attempt));
@@ -1782,12 +1882,18 @@ impl Asker {
                 return Ok(Some(got));
             }
             seen(text);
+            if at_length && attempt == 1 {
+                if let Some(c) = cut.as_deref_mut() {
+                    *c = true;
+                    return Ok(None);
+                }
+            }
         }
         Ok(None)
     }
 
     async fn ask_json(&self, system: &str, user: &str, key: &str, log: &Log) -> Result<Option<Map<String, Value>>, ModelCallError> {
-        self.ask_json_seeing(system, user, key, log, |_| {}).await
+        self.ask_json_seeing(system, user, key, log, |_| {}, None).await
     }
 
     async fn ask_json_logged(
@@ -1796,9 +1902,10 @@ impl Asker {
         user: &str,
         key: &str,
         log: &Log,
+        cut: Option<&mut bool>,
     ) -> Result<Option<Map<String, Value>>, ModelCallError> {
         let mut last: Option<String> = None;
-        let got = self.ask_json_seeing(system, user, key, log, |t| last = Some(t)).await?;
+        let got = self.ask_json_seeing(system, user, key, log, |t| last = Some(t), cut).await?;
         if let (None, Some(t)) = (&got, last) {
             let chars: Vec<char> = t.chars().collect();
             let head: String = chars.iter().take(300).collect();
@@ -1868,24 +1975,63 @@ async fn sleep_read_one(
     let system = fill(&digest, &[("being", Arg::Text(&n.run.being)), ("k", Arg::Num(k as i128)), ("n", Arg::Num(of as i128))]);
     let core = sleep_kept(core);
     let core = if core.is_empty() { "(empty)" } else { &core };
-    let user = format!("<core>\n{core}\n</core>\n<boxes>\n{titles}\n</boxes>\n<memories>\n{}\n</memories>", sleep_lines(part));
-    let mut got = None;
-    for attempt in 1..=3 {
-        let key = if attempt == 1 { format!("read {k}") } else { format!("read {k} again {attempt}") };
-        got = n.read.ask_json_logged(&system, &user, &key, &n.log).await?;
-        if let Some(g) = got.as_mut() {
-            sleep_renumbered(g, part, &n.log, k);
-            break;
+    let (mut found, mut dropped, mut mixed, mut failed) = (Vec::new(), 0, Vec::new(), None);
+    // What is left to read, the next piece last: the piece, its name in the log, and how often it was halved.
+    let mut left: Vec<(&[Line], String, usize)> = vec![(part, k.to_string(), 0)];
+    while let Some((piece, name, depth)) = left.pop() {
+        let user =
+            format!("<core>\n{core}\n</core>\n<boxes>\n{titles}\n</boxes>\n<memories>\n{}\n</memories>", sleep_lines(piece));
+        let mut got = None;
+        let mut cut = false;
+        let halves = piece.len() >= 4 && depth < SLEEP_SPLIT_DEPTH;
+        for attempt in 1..=(if depth == 0 { 3 } else { 1 }) {
+            let key = if attempt == 1 { format!("read {name}") } else { format!("read {name} again {attempt}") };
+            let watch = if attempt == 1 && (halves || depth > 0) { Some(&mut cut) } else { None };
+            got = n.read.ask_json_logged(&system, &user, &key, &n.log, watch).await?;
+            if let Some(g) = got.as_mut() {
+                sleep_renumbered(g, piece, &n.log, &name);
+                break;
+            }
+            if cut {
+                break;
+            }
+        }
+        if got.is_none() && cut && halves {
+            let at = sleep_half(piece);
+            n.log.push(json!({"call": format!("read {name}"), "cut": true, "halves": [at, piece.len() - at]}));
+            left.push((&piece[at..], format!("{name}b"), depth + 1));
+            left.push((&piece[..at], format!("{name}a"), depth + 1));
+            continue;
+        }
+        let known = piece.iter().map(|m| m.eid.clone()).collect();
+        let said = piece.iter().filter(|m| m.mine).map(|m| m.eid.clone()).collect();
+        let (items, lost) = sleep_checked_items(got.as_ref(), &known, &said);
+        let (marks, mixed_dropped) = sleep_checked_mixed(got.as_ref(), piece);
+        if mixed_dropped > 0 {
+            n.log.push(json!({"call": format!("read {name}"), "mixed_dropped": mixed_dropped}));
+        }
+        found.extend(items);
+        dropped += lost;
+        mixed.extend(marks);
+        if got.is_none() {
+            failed = Some(k);
         }
     }
-    let known = part.iter().map(|m| m.eid.clone()).collect();
-    let said = part.iter().filter(|m| m.mine).map(|m| m.eid.clone()).collect();
-    let (found, dropped) = sleep_checked_items(got.as_ref(), &known, &said);
-    let (mixed, mixed_dropped) = sleep_checked_mixed(got.as_ref(), part);
-    if mixed_dropped > 0 {
-        n.log.push(json!({"call": format!("read {k}"), "mixed_dropped": mixed_dropped}));
+    Ok((found, dropped, mixed, failed))
+}
+
+/// Where a part of four memories or more is halved: after the memory that brings the first half to half the
+/// tokens, with two memories at least on each side.
+fn sleep_half(part: &[Line]) -> usize {
+    let total = token_sum(part);
+    let mut size = 0u64;
+    for (i, m) in part.iter().enumerate() {
+        size = size.saturating_add(m.tokens);
+        if size >= total - size {
+            return (i + 1).clamp(2, part.len() - 2);
+        }
     }
-    Ok((found, dropped, mixed, got.is_none().then_some(k)))
+    part.len() - 2
 }
 
 async fn sleep_each<T, F>(futures: Vec<F>, width: u64) -> Result<Vec<T>, ModelCallError>
@@ -1930,7 +2076,13 @@ async fn sleep_combine(
     Ok(if joined.is_empty() { flat } else { joined })
 }
 
-async fn sleep_settle(n: &Night<'_>, core: &str, sec: &str, text: &str) -> Result<(Option<String>, String), ModelCallError> {
+async fn sleep_settle(
+    n: &Night<'_>,
+    core: &str,
+    sec: &str,
+    text: &str,
+    asks: &mut usize,
+) -> Result<(Option<String>, String), ModelCallError> {
     let text = sleep_as_lines(text);
     let Some(old) = section_of(core, sec) else { return Ok((Some(text), "new".into())) };
     let mut held: Vec<String> = old.split('\n').map(strip).filter(|l| !l.is_empty()).map(str::to_string).collect();
@@ -1938,6 +2090,10 @@ async fn sleep_settle(n: &Night<'_>, core: &str, sec: &str, text: &str) -> Resul
     if held.iter().filter(|ln| !tonight.contains(&ln.as_str())).count() <= SLEEP_OVERTURN {
         return Ok((Some(text), "kept".into()));
     }
+    if *asks >= SLEEP_AFTER_ASKS {
+        return Ok((None, "not asked".into()));
+    }
+    *asks += 1;
     let numbered = held.iter().enumerate().map(|(i, ln)| format!("{}. {}", i + 1, sleep_kept(ln))).collect::<Vec<_>>().join("\n");
     let system = fill(SLEEP_SETTLE, &[("being", Arg::Text(&n.run.being)), ("name", Arg::Text(&sleep_named(sec)))]);
     let user = format!("<as it stood>\n{numbered}\n</as it stood>\n<tonight>\n{text}\n</tonight>");
@@ -2014,11 +2170,11 @@ async fn sleep_room(
     used_now: u64,
     cap: u64,
     ledger: &mut Ledger,
-    why: Option<&str>,
+    over: Option<&str>,
 ) -> Result<(), ModelCallError> {
     let count = &n.run.count;
     let where_ = sleep_where(new, k);
-    let core_way = if k == 0 { ", or move people who matter less to a box (say which, under \"moved\")" } else { "" };
+    let core_way = if k == 0 { ", unless you move a person who matters less to a box (say which, under \"moved\")" } else { "" };
     let moved = if k == 0 { ", \"moved\": [{\"section\": \"<heading>\", \"to\": \"1|2|3|4\"}]" } else { "" };
     let system = fill(
         SLEEP_ROOM,
@@ -2036,57 +2192,78 @@ async fn sleep_room(
     let text = text_or_empty(g.get("text"));
     let mut body = strip(&text).to_string();
     body = if body.starts_with("## ") { sleep_join(&sleep_sections(&body)) } else { String::new() };
-    let had = new[0].body.clone();
-    let mut moves: Vec<(usize, String, String)> = Vec::new();
-    if k == 0 && !body.is_empty() {
-        let kept: Vec<(String, String)> =
-            sleep_sections(&body).into_iter().filter(|(h, _)| section_of(&had, h).is_some()).collect();
-        body = sleep_join(&kept);
-    }
-    if k == 0 && !body.is_empty() {
-        if let Some(mine) = section_of(&had, SLEEP_ME) {
-            if section_of(&body, SLEEP_ME).as_ref() != Some(&mine) {
-                body = sleep_set_section(&body, SLEEP_ME, &mine, true);
-            }
-        }
-        for mv in listed(g.get("moved")) {
-            let to = text_of(mv.get("to").unwrap_or(&Value::Null));
-            if !mv.is_object() || !["1", "2", "3", "4"].contains(&to.as_str()) {
-                continue;
-            }
-            let sec = strip(&text_or_empty(mv.get("section"))).to_string();
-            if let Some(held) = section_of(&had, &sec) {
-                if sec != SLEEP_ME && section_of(&body, &sec).is_none() && !moves.iter().any(|(_, s, _)| *s == sec) {
-                    moves.push((to.parse().unwrap_or(1), sec, held));
-                }
+    let held = sleep_sections(&new[k].body);
+    let given = sleep_sections(&body);
+    let stored: Vec<String> = files
+        .iter()
+        .flat_map(|f| sleep_sections(&f.body))
+        .filter(|(_, t)| !strip(t).is_empty())
+        .map(|(h, _)| h)
+        .collect();
+    let moves: Vec<(usize, usize)> = if k == 0 && !body.is_empty() { sleep_room_moves(&held, g.get("moved")) } else { Vec::new() };
+    let moved_at: Vec<usize> = moves.iter().map(|(_, j)| *j).collect();
+    let (pair, doubt) = sleep_room_pairs(&held, &given, &moved_at, k == 0);
+    // The file as the answer leaves it: (the section of the file it is, or None for a new one, name, text).
+    let mut made: Vec<(Option<usize>, String, String)> = Vec::new();
+    for ((name, text), j) in given.iter().zip(&pair) {
+        if let Some(j) = *j {
+            let mine = k == 0 && held[j].0 == SLEEP_ME;
+            made.push((Some(j), held[j].0.clone(), if mine { held[j].1.clone() } else { text.clone() }));
+        } else if k != 0 && !name.is_empty() {
+            match made.iter_mut().rev().find(|(_, h, _)| h == name) {
+                Some(same) => same.2 = strip(&format!("{}\n{text}", same.2)).to_string(),
+                None => made.push((None, name.clone(), text.clone())),
             }
         }
     }
+    if k == 0 && (!made.is_empty() || !moves.is_empty()) {
+        for (j, (h, t)) in held.iter().enumerate() {
+            if h == SLEEP_ME && !pair.contains(&Some(j)) {
+                made.push((Some(j), SLEEP_ME.to_string(), t.clone()));
+            }
+        }
+    }
+    body = sleep_join(&made.iter().map(|(_, h, t)| (h.clone(), t.clone())).collect::<Vec<_>>());
     let mut boxes: std::collections::BTreeMap<usize, String> = Default::default();
-    for (to, sec, held) in &moves {
+    for (to, j) in &moves {
         let from = boxes.get(to).cloned().unwrap_or_else(|| new[*to].body.clone());
-        boxes.insert(*to, sleep_set_section(&from, sec, held, false));
+        boxes.insert(*to, sleep_set_section(&from, &held[*j].0, &held[*j].1, false));
     }
-    if !body.is_empty() && count.of(&body) <= cap && boxes.values().all(|b| count.of(b) <= n.run.s.box_tokens) {
+    let fits = !body.is_empty() && count.of(&body) <= cap && boxes.values().all(|b| count.of(b) <= n.run.s.box_tokens);
+    let stays = |j: usize| {
+        made.iter().any(|(at, _, t)| *at == Some(j) && !doubt.contains(&j) && !strip(t).is_empty())
+            || moved_at.contains(&j)
+            || (k == 0 && held[j].0 == SLEEP_ME)
+    };
+    let mut left: Vec<&String> = Vec::new();
+    for (j, (h, t)) in held.iter().enumerate() {
+        if !h.is_empty() && !strip(t).is_empty() && !stays(j) && stored.contains(h) && !left.contains(&h) {
+            left.push(h);
+        }
+    }
+    if fits && left.is_empty() {
         ledger.rooms.push(json!({"file": k, "before": used_now, "after": count.of(&body)}));
         new[k].body = body;
         for (to, b) in boxes {
             new[to].body = b;
         }
-        ledger.carried.extend(moves.into_iter().map(|(to, sec, held)| (k, to, sec, held)));
+        ledger.carried.extend(moves.iter().map(|(to, j)| (k, *to, held[*j].0.clone(), held[*j].1.clone())));
     } else {
-        ledger.rooms.push(json!({"file": k, "before": used_now, "after": null}));
-        let why = why.map_or_else(
-            || {
-                format!(
-                    "no room: {} of {} tokens, and the room made came back unshaped or still too big; the file stays as it was",
-                    commas(used_now.into()),
-                    commas(cap.into())
-                )
-            },
+        let cause = if fits {
+            let more = if left.len() > 1 { format!(" and {} more", left.len() - 1) } else { String::new() };
+            format!("left out \"{}\"{more}", sleep_named(left[0]))
+        } else {
+            "came back unshaped or still too big".to_string()
+        };
+        let head = over.map_or_else(
+            || format!("no room: {} of {} tokens", commas(used_now.into()), commas(cap.into())),
             str::to_string,
         );
-        ledger.refused.push(json!({"edit": {"file": k, "op": "room"}, "why": why}));
+        ledger.rooms.push(json!({"file": k, "before": used_now, "after": null}));
+        ledger.refused.push(json!({
+            "edit": {"file": k, "op": "room"},
+            "why": format!("{head}, and the room made {cause}; the file stays as it was"),
+        }));
         sleep_put_back(new, files, k, &ledger.carried);
     }
     Ok(())
@@ -2154,10 +2331,24 @@ fn sleep_no_room(message: &str) -> Option<(i64, i64, i64)> {
     })
 }
 
-fn sleep_dedupe(new: &mut Files, deduped: &mut Vec<Value>, carried: &mut Vec<(usize, usize, String, String)>) {
+fn sleep_dedupe(
+    new: &mut Files,
+    deduped: &mut Vec<Value>,
+    carried: &mut Vec<(usize, usize, String, String)>,
+    put_back: &[usize],
+) {
     let in_core: Vec<String> = sleep_sections(&new[0].body).into_iter().map(|(h, _)| h).filter(|h| h != SLEEP_ME).collect();
     for k in SLEEP_BOXES {
+        if put_back.contains(&k) {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
         for (h, _) in sleep_sections(&new[k].body) {
+            if !names.contains(&h) {
+                names.push(h);
+            }
+        }
+        for h in names {
             if in_core.contains(&h) {
                 let (body, gone) = sleep_drop_section(&new[k].body, &h);
                 new[k].body = body;
@@ -2181,8 +2372,10 @@ async fn sleep_write_files(
 ) -> Result<std::collections::BTreeMap<i64, i64>, SleepError> {
     let s = n.run.s;
     let mut made_room: Vec<usize> = Vec::new();
+    let mut put_back: Vec<usize> = Vec::new();
+    let mut refusals = 0usize;
     loop {
-        sleep_dedupe(new, deduped, &mut ledger.carried);
+        sleep_dedupe(new, deduped, &mut ledger.carried, &put_back);
         let writes: Vec<Value> = SLEEP_SLOTS
             .into_iter()
             .filter(|&k| new[k].body != files[k].body || new[k].title != files[k].title)
@@ -2202,6 +2395,10 @@ async fn sleep_write_files(
         let error = error.unwrap_or_default();
         let code = error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str));
         if !matches!(e.status(), Some(400 | 413 | 422)) || code != Some("self_no_room") {
+            return Err(e.into());
+        }
+        refusals += 1;
+        if refusals > SLEEP_WRITE_REFUSALS {
             return Err(e.into());
         }
         let mut d: Map<String, Value> =
@@ -2242,6 +2439,7 @@ async fn sleep_write_files(
             ledger.refused.push(json!({"edit": {"file": k, "op": "room"},
                                        "why": "no room: the service counts it over its cap; the file stays as it was"}));
             sleep_put_back(new, files, ku, &ledger.carried);
+            put_back.push(ku);
             continue;
         }
         made_room.push(ku);
@@ -2256,9 +2454,7 @@ async fn sleep_write_files(
             _ => i128::from(used_now.min(cap)) * 9 / 10,
         };
         let aim = target.min(i128::from(cap)).max(1) as u64;
-        let why = "no room: the service counts it over its cap, and the room made came back unshaped or still too big; \
-                   the file stays as it was";
-        sleep_room(n, new, files, ku, used_now, aim, ledger, Some(why)).await?;
+        sleep_room(n, new, files, ku, used_now, aim, ledger, Some("no room: the service counts it over its cap")).await?;
         sleep_boxes_fit(n, new, files, ledger);
     }
 }
@@ -2483,9 +2679,9 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
             if ripe_text.is_empty() { "(none)" } else { &ripe_text },
             items_json(&items)
         );
-        let mut got = n.merge.ask_json_logged(&system, &user, "merge", log).await?;
+        let mut got = n.merge.ask_json_logged(&system, &user, "merge", log, None).await?;
         if got.is_none() {
-            got = n.merge.ask_json_logged(&system, &format!("{user}{SLEEP_SHORTER}"), "merge shorter", log).await?;
+            got = n.merge.ask_json_logged(&system, &format!("{user}{SLEEP_SHORTER}"), "merge shorter", log, None).await?;
         }
         unmerged = got.is_none();
         let got = got.unwrap_or_default();
@@ -2516,6 +2712,8 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
         let own: Vec<String> =
             [me, being, assistant.as_str()].iter().map(|x| strip(x).to_lowercase()).filter(|x| !x.is_empty()).collect();
         let selfish = |name: &str| own.contains(&strip(name).to_lowercase());
+        let mut asks = 0usize;
+        let mut unasked = 0usize;
         let section_name = |v: Option<&Value>| sleep_heading(&text_or_empty(v)).to_string();
         let edits = match got.get("edits") {
             Some(Value::Array(a)) => a.clone(),
@@ -2557,12 +2755,17 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                         why = Some("a box section is a matter, not its state on a date: rewrite the matter's section".into());
                     } else {
                         let mut text = Some(text_of(&eo["text"]));
+                        let mut not_asked = false;
                         if slot == 0 && sec != me {
-                            let (t, how) = sleep_settle(n, &core, &sec, text.as_deref().unwrap_or("")).await?;
+                            let (t, how) = sleep_settle(n, &core, &sec, text.as_deref().unwrap_or(""), &mut asks).await?;
+                            not_asked = how == "not asked";
                             settled.push(json!({"section": sec, "how": how}));
                             text = t;
                         }
                         match text {
+                            None if not_asked => {
+                                why = Some(format!("{SLEEP_ASKED_OUT}; this rewrite was not settled, so it is not made"))
+                            }
                             None => {
                                 why = Some("one night overturns one line of a person; the sorting came back unshaped".into())
                             }
@@ -2614,8 +2817,10 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                     let sec = section_name(eo.get("section"));
                     match to {
                         Some(to) if to != slot && !((slot == 0 || to == 0) && selfish(&sec)) => {
+                            let back = to == 0 && ledger.carried.iter().any(|(src, _, left, _)| *src == 0 && *left == sec);
                             let (body, text) = sleep_drop_section(&new[slot].body, &sec);
                             match text {
+                                _ if back => why = Some("a section that left the core tonight is not moved back in the same sleep".into()),
                                 None => why = Some("no such section".into()),
                                 Some(_) if section_of(&new[to].body, &sec).is_some() => {
                                     why = Some("move needs a section the file does not hold".into())
@@ -2658,13 +2863,18 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 }
             }
         }
-        sleep_dedupe(&mut new, &mut deduped, &mut ledger.carried);
+        sleep_dedupe(&mut new, &mut deduped, &mut ledger.carried, &[]);
         for (k, h) in &touched {
             let k = *k;
             let Some(t) = section_of(&new[k].body, h).filter(|t| !t.is_empty()) else { continue };
             if k == 0 && h == me {
                 continue;
             }
+            if asks >= SLEEP_AFTER_ASKS {
+                unasked += 1;
+                continue;
+            }
+            asks += 1;
             let where_ = sleep_where(&new, k);
             let numbered = t
                 .split('\n')
@@ -2693,6 +2903,11 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                 if ls.len() <= limit && long == 0 {
                     continue;
                 }
+                if asks >= SLEEP_AFTER_ASKS {
+                    unasked += 1;
+                    continue;
+                }
+                asks += 1;
                 let why = [
                     if ls.len() > limit { format!("{} lines", ls.len()) } else { String::new() },
                     if long > 0 { format!("{long} lines longer than one idea") } else { String::new() },
@@ -2723,6 +2938,10 @@ async fn sleep_night(n: &Night<'_>) -> Result<Value, SleepError> {
                                                "why": format!("fold came back unshaped or longer ({why})")}));
                 }
             }
+        }
+        if unasked > 0 {
+            ledger.refused.push(json!({"edit": {"op": "fold"},
+                                       "why": format!("{SLEEP_ASKED_OUT}; {unasked} more were not asked, and their sections stay as they are")}));
         }
         for k in SLEEP_SLOTS {
             let cap = sleep_cap(&s, k);

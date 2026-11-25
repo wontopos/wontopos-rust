@@ -33,7 +33,7 @@ async fn main() -> Result<(), WosError> {
 
 - **The same in every language** — identical recall whichever language a memory was written in (Korean · Japanese · Chinese · English).
 - **We never run an LLM over your stored memories.** Sleep, when you turn it on, runs on your own model with your own key.
-- **Bounded retrieval** — `recall()` returns the recent turns, at most `limit` long-term memories (default 10, up to 20) and at most `context_limit` rows of the surrounding conversation (default 10, up to 20), however much you've stored.
+- **Bounded retrieval** — `recall()` returns the recent turns (on Scroll 2: 50 lines by default, and `short_term_limit` sets 0 to 100), at most `limit` long-term memories (default 10, up to 20) and at most `context_limit` rows of the surrounding conversation (default 10, up to 20), however much you've stored. Your LLM bill stops growing with history.
 
 ## Methods
 
@@ -51,7 +51,7 @@ async fn main() -> Result<(), WosError> {
 | `search_full` · `search_full_with` | The same search with each part kept apart, `images` and `verify_used` included. |
 | `search_self` · `search_self_with` | The assistant's own words, kept apart from what others said. |
 | `history(user_id)` | The recent conversation. |
-| `memory_tools_preset(user_id, None, "S-2")?.with_seen(true)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. |
+| `memory_tools_preset(user_id, None, "S-2")?.with_seen(true)` | Adds `memory_recent` and `memory_seen` to the memory tools: the recent conversation, newest first, and the memories held for one of its lines as they stand now. Off by default; `memory_recent` takes each reply's count from `history`, and `memory_seen` asks `seen` once. `with_recent_turns(n)?` sets how many lines `memory_recent` shows, 0 to 100 (default 50). |
 | `get(user_id, memory_id)` | One memory by id and its metadata. |
 | `list_memories` · `export_memories` | Every memory in a store, a page at a time or all at once. |
 | `lineage(user_id, memory_id)` | The edits that followed one memory. |
@@ -66,6 +66,7 @@ async fn main() -> Result<(), WosError> {
 | `add_speaker` · `list_speakers` · `remove_speaker` | Register, list and unregister the people a store hears from. |
 | `by_speaker(speaker, user_id, ...)` | What one person said, newest first. |
 | **Stores** | |
+| `settings(user_id)` · `set_settings(user_id, &SettingsOpts)` | A store's time zone and default speakers, and setting them. A Scroll 2 store needs both before its first write. |
 | `create_store` · `list_stores` · `delete_store` | One isolated memory space per end-user, agent or topic. Where only an admin key lists stores, `list_stores` with a standard key gets a 403 (`ErrorKind::PermissionDenied`). |
 | `delete(user_id, memory_id)` · `delete_all(user_id)` | Delete one memory, or every memory in a store. `delete_all` also clears the store's time zone and speakers, so a Scroll 2 store needs `set_settings` and its speakers again before the next write. |
 | **Account** | |
@@ -142,6 +143,32 @@ returned, so sorting by it makes results worse. There is no `score` field.
 up to 50 people to start (a limit we plan to raise); `"me"` never needs
 registration and never counts against it.
 
+## Starting a store on Scroll 2
+
+A Scroll 2 store keeps the real time of every memory and who said it, so it needs its
+time zone and its speakers before the first write. A write before that is refused with
+`time_zone_required` or `speaker_required`, and nothing is stored.
+
+```rust
+use wontopos::{Client, DefaultSpeakers, SettingsOpts};
+
+let mem = Client::new("wos-live-...").with_model("scroll-2");
+mem.create_store("alice").await?;
+mem.add_speaker("Alice", "alice").await?;   // the person
+mem.add_speaker("Mina", "alice").await?;    // the name your assistant goes by
+mem.set_settings("alice", &SettingsOpts {
+    time_zone: Some("Asia/Seoul".into()),
+    default_speakers: Some(DefaultSpeakers {
+        user: Some(Some("Alice".into())),
+        assistant: Some(Some("Mina".into())),
+    }),
+    ..Default::default()
+}).await?;
+
+mem.add_turn("I moved to Busan last week.", "Noted. How is the new place?", "alice").await?;
+let ctx = mem.recall("where does alice live?", "alice").await?;
+```
+
 ## Photos
 
 On a model whose `list_models()` capabilities include `images`, a memory can carry a photo.
@@ -196,6 +223,16 @@ at once, so a hit can never predate a new memory.
 let hits = mem.search_with("...the conversation so far...", "alice", 10,
                            serde_json::json!({"cache_control": {"ttl": "5m"}})).await?;  // or "1h"
 ```
+
+## When each call's time shows
+
+Keep one client for the life of your process: it reuses its connection while one is open,
+and a new connection costs extra round trips to the service. A connection left idle for 90
+seconds is closed, and a copy made by `with_timeout` opens its own, so set the timeout once
+and keep that copy. A `ping()` shortly before a call whose time shows opens the connection
+ahead of it. `ping()` is a metered call itself, so make it where the wait would show, not
+before every call. In a voice app, start `recall` while the speech is still being
+transcribed.
 
 ## Reliability
 
@@ -312,7 +349,7 @@ data to fix it.
 ## Changelog
 
 The three clients release in lockstep — same version, same surface, same day. Patch
-releases are additive. Sixteen inside 2.2 were not, deliberately and each with its
+releases are additive. Seventeen inside 2.2 were not, deliberately and each with its
 reason; the changelog lists them.
 
 See [CHANGELOG.md](https://github.com/wontopos/wontopos-rust/blob/main/CHANGELOG.md).

@@ -121,7 +121,7 @@ fn night_summary(res: &Value) -> Value {
 }
 
 const REFERENCE_CALLS: usize = 27;
-const REFERENCE_CALLS_DIGEST: &str = "66cc5bf1dbde699a22947dc8e1b55991ec0fd5f410bcf6bcc27f3f171144cf4a";
+const REFERENCE_CALLS_DIGEST: &str = "1fdfdb7d867b28e3e95a1d8fe57a35e3c07a5078d71f2dff63a96e9805dce82f";
 const REFERENCE_NIGHTS_DIGEST: &str = "bbedfa7a042245922190822e61443b41086ee03466b8f61da790cae7bb0184b7";
 const REFERENCE_STATE_DIGEST: &str = "e3ebd0a08e7d1eae4e93b0a26bc7cdfec5c2cd5677d46e634ad367351117033b";
 
@@ -306,7 +306,12 @@ fn scripted(system: &str, user: &str, first: bool) -> String {
         return json!({"text": folded}).to_string();
     }
     if system.contains("there is no room") {
-        return json!({"text": "## Big list\n- Trimmed to what matters."}).to_string();
+        let held: Vec<&str> = user.lines().filter_map(|ln| ln.strip_prefix("## ")).collect();
+        if held.contains(&"Big list") {
+            return json!({"text": "## Big list\n- Trimmed to what matters."}).to_string();
+        }
+        let kept: Vec<String> = held.iter().map(|h| format!("## {h}\n- Trimmed.")).collect();
+        return json!({"text": kept.join("\n\n")}).to_string();
     }
     panic!("a call the script does not know: {}", &system[..80]);
 }
@@ -761,7 +766,7 @@ fn the_prompts_are_the_reference_bytes() {
         ("_SLEEP_SETTLE", SLEEP_SETTLE, "c20ba6effc265bd5612530f0f657e660a30eff85f28fd846b79ba5bed20163ca"),
         ("_SLEEP_FOLD_SECTION", SLEEP_FOLD_SECTION, "294ec09cd08d75e1778d567c7a3b1eb2dd4dd221f662334f51d8449260fe3881"),
         ("_SLEEP_TIDY", SLEEP_TIDY, "dff0600c9f98c1cc5928f75dd0101e5928e31f06a0d6aadc1a2f553706e3c16c"),
-        ("_SLEEP_ROOM", SLEEP_ROOM, "41aff5a9ccb596e41031bd269a78dc4bc71aa5a9a47ec08f67ac8361c4926168"),
+        ("_SLEEP_ROOM", SLEEP_ROOM, "14373fe41ff1d594a8b90b6be022a567d1a9233844f213351270fb4ce6243186"),
         ("_SLEEP_READER_NOTE", SLEEP_READER_NOTE, "0fa78c4e82cdb880ad70871895a61d7dcdc6505d5b1d1a0498c6c3c75669f028"),
     ] {
         assert_eq!(sha256(text.as_bytes()), want, "{name}");
@@ -787,7 +792,7 @@ fn the_settings_are_the_reference_ones() {
     );
     assert_eq!((SLEEP_PAGE_TOKENS, SLEEP_LINE_FRAME, SLEEP_MAX_TOKENS), (20_000, 12, 16_000));
     assert_eq!((SLEEP_IN_PER_100, SLEEP_OUT_PER_100, SLEEP_MARGIN, SLEEP_ESTIMATE_PRICES), (172, 7, 0.15, (2.0, 10.0)));
-    assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.2", "1.0.2"));
+    assert_eq!((SLEEP_ESTIMATE_MODEL, SLEEP_VERSION, crate::SLEEP_VERSION), ("claude-sonnet-5-5", "1.0.3", "1.0.3"));
     let o = SleepOpts::default();
     assert_eq!((o.being.as_str(), o.prompt.as_str(), o.done, o.max_tokens), ("the assistant", "", true, 16_000));
     assert_eq!((o.line_time, o.settings), (SleepLineTime::CreatedAt, s));
@@ -1142,11 +1147,11 @@ async fn a_file_the_service_counts_over_its_cap_is_made_room_for_once_then_kept_
     let slots: Vec<Vec<u64>> =
         writes.iter().map(|ws| ws.as_array().unwrap().iter().map(|w| w["slot"].as_u64().unwrap()).collect()).collect();
     assert_eq!(slots, [vec![0, 1], vec![0, 1], vec![0]]);
-    assert_eq!(writes[1][1]["body"], "## Big list\n- Trimmed to what matters.\n");
+    assert_eq!(writes[1][1]["body"], "## Garden project\n- Trimmed.\n");
     let room: Vec<String> = model.texts().into_iter().map(|(s, _)| s).filter(|s| s.contains("there is no room")).collect();
     assert_eq!(room.len(), 1);
     assert!(room[0].contains("left its box \"\" at 13 tokens, over its cap\nof 11: there is no room"), "{}", room[0]);
-    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 9}]));
+    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 7}]));
     let refused = res["refused"].as_array().unwrap();
     assert_eq!(
         refused[refused.len() - 1],
@@ -1169,9 +1174,9 @@ async fn when_the_service_names_the_file_and_its_count_the_room_is_made_against_
     let res = sleep_with(&mem, &model, night("2026-09-15 23:00")).await.unwrap();
     let room: Vec<String> = model.texts().into_iter().map(|(s, _)| s).filter(|s| s.contains("there is no room")).collect();
     assert!(room[0].contains("at 13 tokens, over its cap\nof 10: there is no room"), "{}", room[0]);
-    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 9}]));
+    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 7}]));
     assert_eq!(res["written"], json!({"0": 1, "1": 1}));
-    assert_eq!(svc.lock().unwrap().latest(1).unwrap().body, "## Big list\n- Trimmed to what matters.\n");
+    assert_eq!(svc.lock().unwrap().latest(1).unwrap().body, "## Garden project\n- Trimmed.\n");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1184,7 +1189,7 @@ async fn a_no_room_answer_that_counts_0_tokens_makes_room_against_the_clients_ow
     let res = sleep_with(&mem, &model, night("2026-09-15 23:00")).await.unwrap();
     let room: Vec<String> = model.texts().into_iter().map(|(s, _)| s).filter(|s| s.contains("there is no room")).collect();
     assert!(room[0].contains("at 13 tokens, over its cap\nof 11: there is no room"), "{}", room[0]);
-    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 9}]));
+    assert_eq!(res["rooms"], json!([{"file": 1, "before": 13, "after": 7}]));
     assert_eq!(res["written"], json!({"0": 1, "1": 1}));
 }
 
@@ -1601,7 +1606,7 @@ async fn the_estimate_reads_counts_and_prices_and_the_sleep_reads_on_under_its_s
     let frame = sleep_tokens(SLEEP_DIGEST) + sleep_tokens("") + sleep_tokens("1: (empty)\n2: (empty)\n3: (empty)\n4: (empty)");
     let (sent, written) = (((tokens + frame) * 172).div_ceil(100), (tokens * 7).div_ceil(100));
     let basis = |prices: [f64; 2]| {
-        json!({"sleep_version": "1.0.2", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
+        json!({"sleep_version": "1.0.3", "model": "claude-sonnet-5-5", "effort": "high", "prompt_caching": false,
                "margin": 0.15, "prices": prices})
     };
     let cost = round_to((sent as f64 * 1.0 + written as f64 * 5.0) * 1.15 / 1_000_000.0, 6);

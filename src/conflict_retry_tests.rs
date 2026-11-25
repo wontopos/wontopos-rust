@@ -115,6 +115,17 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn get_image_reads_the_type_of_a_header_with_a_byte_outside_ascii() {
+        let (base, _) = mock_server(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png; name=\"\u{e9}.png\"\r\nContent-Length: 4\r\nConnection: close\r\n\r\nPNG!".to_string(),
+        ]);
+        let mem = Client::with_base_url("wos-test-xxxxxxxxxx", &base);
+        let (bytes, ctype) = mem.get_image("alice", "11111111-1111-1111-1111-111111111111").await.unwrap();
+        assert_eq!(bytes, b"PNG!");
+        assert_eq!(ctype, "image/png");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn get_image_retries_a_write_lock_409_too() {
         let (base, hits) = mock_server(vec![
             http("409 Conflict", "", WRITE_LOCK),

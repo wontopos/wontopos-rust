@@ -1,5 +1,5 @@
 use super::rooms_work_tests::{count, refusal, scripted, Log, KEY};
-use super::{Client, LookOpts, MemoryTools, Rooms, ToolFormat};
+use super::{Client, LookOpts, MemoryTools, RecallOpts, Rooms, ToolFormat};
 use serde_json::json;
 
 const OPEN: &str =
@@ -155,4 +155,74 @@ fn nothing_the_model_sees_changes() {
         }
     }
     assert_eq!(count(&seen), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn recall_asks_for_50_lines_of_the_recent_conversation_where_the_model_keeps_a_window() {
+    let (base, seen) = scripted(vec![]);
+    let mem = Client::with_base_url(KEY, &base).with_model("scroll-2");
+    let lines = |n: usize| RecallOpts { short_term_limit: Some(n), ..Default::default() };
+    mem.recall_opts("q", "u", &RecallOpts::default()).await.unwrap();
+    mem.recall_opts("q", "u", &lines(0)).await.unwrap();
+    mem.recall_opts("q", "u", &lines(100)).await.unwrap();
+    mem.with_model("tablet-2").recall_opts("q", "u", &RecallOpts::default()).await.unwrap();
+    let plain = Client::with_base_url(KEY, &base);
+    plain.recall_opts("q", "u", &RecallOpts::default()).await.unwrap();
+    plain.with_model("scroll-2").recall_opts("q", "u", &RecallOpts::default()).await.unwrap();
+    plain.with_model("scroll-2").recall_opts("q", "u", &lines(7)).await.unwrap();
+    // The plain call and the one that takes the body's fields as they are ask the same.
+    mem.recall("q", "u").await.unwrap();
+    mem.recall_with("q", "u", json!({})).await.unwrap();
+    mem.recall_with("q", "u", json!({"short_term_limit": null})).await.unwrap();
+    mem.recall_with("q", "u", json!({"short_term_limit": 3})).await.unwrap();
+    plain.recall("q", "u").await.unwrap();
+    plain.recall_with("q", "u", json!({"short_term_limit": 3})).await.unwrap();
+    plain.recall_with("q", "u", json!({"short_term_limit": null})).await.unwrap();
+    let asked: Vec<serde_json::Value> = seen.lock().unwrap().iter().map(|s| s.body["short_term_limit"].clone()).collect();
+    assert_eq!(json!(asked), json!([50, 0, 100, null, null, 50, 7, 50, 50, 50, 3, null, 3, null]));
+    // A number not given is no key in the body, a null among them.
+    assert!(!seen.lock().unwrap().iter().any(|s| matches!(s.body.get("short_term_limit"), Some(v) if v.is_null())));
+    for bad in [101usize, 500] {
+        let says = format!("short_term_limit must be an integer between 0 and 100, got {bad}.");
+        assert_eq!(refusal(mem.recall_opts("q", "u", &lines(bad)).await), says);
+        assert_eq!(refusal(mem.recall_with("q", "u", json!({"short_term_limit": bad})).await), says);
+        assert_eq!(refusal(plain.recall_with("q", "u", json!({"short_term_limit": bad})).await), says);
+    }
+    for bad in [json!("50"), json!(1.5), json!(-1), json!(true)] {
+        let m = refusal(mem.recall_with("q", "u", json!({"short_term_limit": bad})).await);
+        assert!(m.starts_with("short_term_limit must be an integer between 0 and 100, got "), "{m}");
+    }
+    assert_eq!(count(&seen), 14);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_recent_shows_the_newest_50_lines_or_as_many_as_recent_turns_says() {
+    let turns: Vec<serde_json::Value> = (0..120)
+        .map(|i| {
+            json!({"role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("line {i}"),
+                   "timestamp": format!("2026-10-20T09:{:02}:{:02}Z", i / 60, i % 60)})
+        })
+        .collect();
+    let window = json!({"turns": turns}).to_string();
+    let (base, seen) = scripted(vec![(200, window.as_str()); 4]);
+    let seeing = || tools(&base).with_seen(true);
+    let shown = |text: String| -> Vec<String> { text.split('\n').skip(1).map(str::to_string).collect() };
+    let lines = shown(seeing().run("memory_recent", &json!({})).await.unwrap());
+    assert_eq!((lines.len(), lines[0].as_str(), lines[49].as_str()), (50, "#1 you: line 119", "#50 user: line 70"));
+    let lines = shown(seeing().with_recent_turns(100).unwrap().run("memory_recent", &json!({})).await.unwrap());
+    assert_eq!((lines.len(), lines[99].as_str()), (100, "#100 user: line 20"));
+    let lines = shown(seeing().with_recent_turns(1).unwrap().run("memory_recent", &json!({})).await.unwrap());
+    assert_eq!(lines, ["#1 you: line 119"]);
+    let off = seeing().with_recent_turns(0).unwrap();
+    assert_eq!(off.run("memory_recent", &json!({})).await.unwrap(), "The recent conversation is not shown here.");
+    assert_eq!(off.run("memory_seen", &json!({"n": 1})).await.unwrap(), "Refused: #1 is not a line memory_recent gave.");
+    assert_eq!(count(&seen), 3, "with no recent turns the window is not read");
+    let few = seeing().with_recent_turns(3).unwrap();
+    assert_eq!(few.run("memory_recent", &json!({})).await.unwrap().split('\n').count(), 4);
+    assert_eq!(few.run("memory_seen", &json!({"n": 4})).await.unwrap(), "Refused: #4 is not a line memory_recent gave.");
+    assert_eq!(count(&seen), 4, "a line that was not shown is not looked up");
+    assert_eq!(
+        refusal(seeing().with_recent_turns(101).map(|_| ())),
+        "recent_turns must be an integer between 0 and 100, got 101."
+    );
 }

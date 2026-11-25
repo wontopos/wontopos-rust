@@ -258,6 +258,37 @@
     }
 
     #[test]
+    fn an_errors_text_loses_the_c1_controls_and_the_unicode_line_separators_too() {
+        let (message, request_id) = super::http::parse_error(
+            "{\"error\":{\"type\":\"t\",\"message\":\"a\\u0085b\\u009bc\\u2028d\\u2029e\\u001bf\",\"request_id\":\"r\\u009d1\"}}",
+        );
+        assert_eq!((message.as_str(), request_id.as_deref()), ("abcdef", Some("r1")));
+    }
+
+    #[test]
+    fn a_pictures_type_is_one_bare_type_and_subtype_or_octet_stream() {
+        for (given, want) in [
+            (Some("image/png"), "image/png"),
+            (Some("IMAGE/JPEG; charset=binary"), "image/jpeg"),
+            (Some(" image/svg+xml\t"), "image/svg+xml"),
+            (Some("text/html; charset=utf-8"), "text/html"),
+            (Some("image/x\\..\\..\\Users\\Public\\run.bat"), "application/octet-stream"),
+            (Some("image/../../etc"), "application/octet-stream"),
+            (Some("image/"), "application/octet-stream"),
+            (Some("/png"), "application/octet-stream"),
+            (Some("image/.png"), "application/octet-stream"),
+            (Some("image/p\u{f1}g"), "application/octet-stream"),
+            (Some(""), "application/octet-stream"),
+            (Some("application/json, image/webp"), "image/webp"),
+            (Some("image/png, ../x"), "image/png"),
+            (Some("text/plain; title=\"a,b\""), "text/plain"),
+            (None, "application/octet-stream"),
+        ] {
+            assert_eq!(super::http::media_type(given), want, "{given:?}");
+        }
+    }
+
+    #[test]
     fn debug_hides_credentials_in_the_base_url() {
         for base in [
             "https://user:hunter2pass@proxy.example.com",

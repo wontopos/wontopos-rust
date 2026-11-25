@@ -42,6 +42,7 @@ impl Client {
             told: std::sync::atomic::AtomicBool::new(false),
             own_words: None,
             diversity: None,
+            recent_turns: RECENT_TURNS,
         })
     }
 }
@@ -197,6 +198,7 @@ pub struct MemoryTools {
     told: std::sync::atomic::AtomicBool,
     own_words: Option<bool>,
     diversity: Option<&'static str>,
+    recent_turns: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -301,6 +303,14 @@ impl MemoryTools {
     pub fn with_seen(mut self, on: bool) -> Self {
         self.seen = on;
         self
+    }
+
+    /// How many lines of the recent conversation `memory_recent` shows, the newest first, 0 to 100 (default 50;
+    /// 0 shows none, and the window is not read for it). `memory_recent` comes with [`MemoryTools::with_seen`]:
+    /// without it this sets nothing.
+    pub fn with_recent_turns(mut self, turns: usize) -> Result<Self, WosError> {
+        self.recent_turns = check_range("recent_turns", turns, 0, RECENT_TURNS_MAX)?;
+        Ok(self)
     }
 
     /// Add `memory_usage`, and a line on a result when the plan's week runs low (default off).
@@ -589,6 +599,9 @@ impl MemoryTools {
     }
 
     async fn answer(&self, tool: MemoryTool, input: &serde_json::Value, format: ToolFormat) -> ToolContent {
+        if crate::router::nests_deeper(input, 127) {
+            return self.noted(ToolContent::Text(NOT_JSON.into()), false);
+        }
         let (content, paid) = PAID_CALL
             .scope(std::cell::Cell::new(false), async {
                 let content = self.answer_plain(tool, input, format).await;
@@ -746,11 +759,15 @@ impl MemoryTools {
     }
 
     async fn recent_lines(&self) -> Result<String, WosError> {
+        if self.recent_turns == 0 {
+            *self.recent.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+            return Ok("The recent conversation is not shown here.".into());
+        }
         let store = self.store.as_str();
         let turns = self.client.history(store).await?;
         let mut lines = Vec::new();
         let mut out = Vec::new();
-        for t in turns.iter().rev() {
+        for t in turns.iter().rev().take(self.recent_turns) {
             let speaker = t.get("speaker").and_then(|v| v.as_str()).map(js_trim).unwrap_or_default();
             let reply = t.get("role").and_then(|v| v.as_str()) == Some("assistant");
             let who = if reply || speaker == "me" { "you".into() } else if speaker.is_empty() { "user".into() } else { shown_speaker(speaker) };
@@ -892,7 +909,7 @@ fn is_photo(m: &serde_json::Value) -> bool {
 fn photo_content(n: u32, bytes: &[u8], kind: &str, format: ToolFormat) -> ToolContent {
     let kind = kind.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
     if !matches!(kind.as_str(), "image/jpeg" | "image/png" | "image/gif" | "image/webp") {
-        let kind = if kind.is_empty() { "unknown" } else { kind.as_str() };
+        let kind = if kind.is_empty() || kind == "application/octet-stream" { "unknown" } else { kind.as_str() };
         return ToolContent::Text(format!("Refused: [{n:02}] is a picture of a kind that cannot be shown ({kind})."));
     }
     let data = base64(bytes);
@@ -1003,7 +1020,6 @@ pub(crate) fn said_lines(said: &[Said]) -> String {
     let mut out = Vec::new();
     let mut day: Option<Option<&str>> = None;
     let mut zone = "";
-    let mut minute: Option<&str> = None;
     for (i, s) in said.iter().enumerate() {
         let date = s.date.as_deref();
         let z = if s.time.is_some() {
@@ -1021,18 +1037,11 @@ pub(crate) fn said_lines(said: &[Said]) -> String {
             });
             day = Some(date);
             zone = z;
-            minute = None;
         }
-        let time = s.time.as_deref();
-        let head = match time {
-            None => String::new(),
-            Some(t) if minute == Some(t) => "      ".to_string(),
-            Some(t) => format!("{t} "),
-        };
-        if time.is_some() {
-            minute = time;
-        }
-        out.push(head + &s.timed);
+        out.push(match s.time.as_deref() {
+            None => s.timed.clone(),
+            Some(t) => format!("{t} {}", s.timed),
+        });
     }
     out.join("\n")
 }

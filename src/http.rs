@@ -282,8 +282,24 @@ pub(crate) fn cap_msg(s: String) -> String {
     out
 }
 
+pub(crate) fn media_type(value: Option<&str>) -> String {
+    let part = |s: &str| {
+        (1..=127).contains(&s.len())
+            && s.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
+    };
+    let mut out = "application/octet-stream".to_string();
+    for given in value.unwrap_or("").split(',') {
+        let named = given.split(';').next().unwrap_or("").trim_matches([' ', '\t']);
+        if matches!(named.split_once('/'), Some((kind, sub)) if part(kind) && part(sub)) {
+            out = named.to_ascii_lowercase();
+        }
+    }
+    out
+}
+
 pub(crate) fn strip_controls(s: &str) -> String {
-    s.chars().filter(|c| *c >= ' ' && *c != '\u{7f}').collect()
+    s.chars().filter(|c| *c >= ' ' && !('\u{7f}'..='\u{9f}').contains(c) && !matches!(c, '\u{2028}' | '\u{2029}')).collect()
 }
 
 pub(crate) fn parse_error(text: &str) -> (String, Option<String>) {
@@ -351,7 +367,14 @@ impl Refusal {
             _ => None,
         };
         let expired = error.as_ref().and_then(|e| e.get("code")).and_then(|c| c.as_str()) == Some("sleep_expired");
-        let gone = |m: String| if status == 410 && !expired { format!("{m} {GONE_HINT}") } else { m };
+        let code = error.as_ref().and_then(|e| e.get("code")).and_then(|c| c.as_str());
+        let gone = |m: String| {
+            let m = if status == 410 && !expired { format!("{m} {GONE_HINT}") } else { m };
+            match setup_hint(status, &m, code) {
+                Some(hint) => format!("{m} {hint}"),
+                None => m,
+            }
+        };
         let message = match text {
             Ok(t) => {
                 let (message, request_id) = parse_error(&t);
@@ -478,7 +501,9 @@ impl Client {
 
     pub(crate) async fn request_bytes(&self, path: &str, body: &serde_json::Value) -> Result<(Vec<u8>, String), WosError> {
         let (status, headers, bytes) = self.exchange(reqwest::Method::POST, path, Some(body), None, None, false, None).await?;
-        let ctype = headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+        let given: Vec<String> =
+            headers.get_all(reqwest::header::CONTENT_TYPE).iter().map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned()).collect();
+        let ctype = media_type(Some(&given.join(",")));
         if bytes.is_empty() {
             return Err(WosError::Api { status, message: "empty image body — the service returned no bytes".into() });
         }

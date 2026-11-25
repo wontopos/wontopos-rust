@@ -37,6 +37,31 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_number_json_cannot_carry_in_an_answer_is_refused() {
+        let long = format!("{{\"total_memories\": {}}}", "9".repeat(400));
+        let bodies = [
+            "{\"total_memories\": NaN}",
+            "{\"total_memories\": Infinity}",
+            "{\"total_memories\": -Infinity}",
+            "{\"total_memories\": 1e999}",
+            "{\"total_memories\": -1e999}",
+            long.as_str(),
+            "{\"rows\": [{\"at\": 1, \"score\": 1e999}]}",
+        ];
+        let mut script: Vec<(u16, &str)> = bodies.iter().map(|b| (200, *b)).collect();
+        script.push((200, "{\"total_memories\": 2.5, \"largest\": 1e300}"));
+        let (base, seen) = scripted(script);
+        let mem = Client::with_base_url(KEY, &base).with_retries(0);
+        for body in bodies {
+            let e = mem.stats("alice").await.unwrap_err().to_string();
+            assert!(e.starts_with("[200] invalid JSON in response: "), "{body}: {e}");
+            assert!(e.len() < 200, "{body}: {e}");
+        }
+        assert_eq!(mem.stats("alice").await.unwrap(), serde_json::json!({"total_memories": 2.5, "largest": 1e300}));
+        assert_eq!(count(&seen), bodies.len() + 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_409_asking_for_an_endless_wait_is_a_conflict_not_retried() {
         let body = format!(
             "{{\"error\":{{\"type\":\"conflict_error\",\"message\":\"busy\",\"retry_after_ms\":{}}}}}",

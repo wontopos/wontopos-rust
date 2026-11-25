@@ -72,7 +72,7 @@
             (opts(|o| o.room_limit = Some(0)), "room_limit must be an integer between 1 and 20, got 0"),
             (opts(|o| o.room_limit = Some(21)), "room_limit must be an integer between 1 and 20, got 21"),
             (opts(|o| o.room_expand_tokens = Some(20_001)), "room_expand_tokens must be an integer between 0 and 20000"),
-            (opts(|o| o.short_term_limit = Some(501)), "short_term_limit must be an integer between 0 and 500"),
+            (opts(|o| o.short_term_limit = Some(501)), "short_term_limit must be an integer between 0 and 100"),
             (opts(|o| o.short_term_budget_tokens = Some(8_001)), "short_term_budget_tokens must be an integer between 0 and 8000"),
             (opts(|o| o.max_images = Some(6)), "max_images must be an integer between 0 and 5"),
             (opts(|o| o.today_start = Some(" ".into())), "today_start is required"),
@@ -153,7 +153,7 @@
             (SettingsOpts { time_zone: Some("  ".into()), ..Default::default() }, "time_zone is required"),
             (
                 SettingsOpts { default_speakers: Some(blank), ..Default::default() },
-                "default_speakers.assistant must be a name, or Some(None) to clear it",
+                "default_speakers.assistant must be a speaker's name (a non-blank string), or Some(None) to clear it",
             ),
         ] {
             let m = refusal(mem.set_settings("u", &o).await);
@@ -289,7 +289,7 @@
         for (m, want) in [
             (refusal(mem.set_settings("u", &nel).await), "default_speakers.assistant contains a line break or a control character."),
             (refusal(mem.relabel_speaker("Dana", "Kai\u{85}", "u", None).await), "to_speaker contains a line break or a control character."),
-            (refusal(mem.set_settings("u", &bom).await), "default_speakers.user must be a name"),
+            (refusal(mem.set_settings("u", &bom).await), "default_speakers.user must be a speaker's name"),
             (refusal(mem.relabel_speaker("\u{feff}", "Kai", "u", None).await), "from_speaker must be a speaker's name"),
             (refusal(mem.relabel_speaker("Dana", " \u{feff}", "u", None).await), "to_speaker must be a speaker's name"),
             (refusal(mem.forget_speaker(["Dana", "\u{feff}"], "u", true).await), "speakers[1] must be a speaker's name"),
@@ -433,8 +433,8 @@
         let mem = Client::with_base_url(KEY, &base);
         let spoken = BulkOpts { speaker: Some("Ana".into()), ..segments(vec![segment("x", None, None)]) };
         for (m, want) in [
-            (refusal(mem.add_bulk_opts("x", "u", "chat", &segments(vec![segment("y", None, None)])).await), "content and segments are exclusive"),
-            (refusal(mem.add_bulk_opts(None, "u", "chat", &BulkOpts::default()).await), "needs content or segments"),
+            (refusal(mem.add_bulk_opts("x", "u", "chat", &segments(vec![segment("y", None, None)])).await), "add_bulk_opts takes content or segments, not both"),
+            (refusal(mem.add_bulk_opts(None, "u", "chat", &BulkOpts::default()).await), "add_bulk_opts needs content, or segments"),
             (refusal(mem.add_bulk_opts(None, "u", "chat", &segments(vec![])).await), "at least one segment"),
             (
                 refusal(mem.add_bulk_opts(None, "u", "chat", &segments(vec![segment("x", None, None), segment(" ", None, None)])).await),

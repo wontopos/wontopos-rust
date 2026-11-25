@@ -7,6 +7,7 @@ pub(crate) const ROUTER_PROMPT_MAX_TOKENS: u64 = 95_000;
 pub(crate) const ROUTER_STABLE_MAX_TOKENS: u64 = 80_000;
 pub(crate) const FRAME_TOKENS: u64 = 64;
 pub(crate) const EXCHANGE_MAX_CHARS: usize = 2_000;
+const EXCHANGES_HELD: usize = 100;
 pub(crate) const EXCHANGE_ANSWER_CHARS: usize = 300;
 pub(crate) const SPEAKER_MAX_BYTES: usize = 256;
 pub(crate) const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
@@ -417,6 +418,9 @@ impl RouterTools {
         if name != "ask" {
             return Err(refused(format!("not the ask tool: {}", js_quote(name))));
         }
+        if nests_deeper(input, 127) {
+            return Ok(model_refusal(router_text::NOT_JSON));
+        }
         let request = match input.get("request") {
             Some(serde_json::Value::String(s)) if !js_trim(s).is_empty() => s.clone(),
             _ => return Ok(model_refusal(router_text::NO_REQUEST)),
@@ -766,7 +770,12 @@ impl RouterState {
     fn reserve(self: &std::sync::Arc<Self>, store: &str, turn: Option<&str>, day: &str, now: std::time::Instant) -> Result<Reservation, String> {
         let l = self.limits;
         let mut c = lock(&self.counts);
-        let today = match c.days.get(&store.to_string()) {
+        let held = c.days.get(&store.to_string()).cloned();
+        let day = match &held {
+            Some((d, _)) if d.as_str() > day => d.as_str(),
+            _ => day,
+        };
+        let today = match &held {
             Some((d, n)) if d == day => *n,
             _ => 0,
         };
@@ -1392,7 +1401,7 @@ fn check_skill(def: &serde_json::Value, st: &RouterState) -> Result<SkillDefinit
 
 const SKILL_MAX_DEPTH: usize = 100;
 
-fn nests_deeper(v: &serde_json::Value, levels: usize) -> bool {
+pub(crate) fn nests_deeper(v: &serde_json::Value, levels: usize) -> bool {
     match v {
         serde_json::Value::Object(o) => levels == 0 || o.values().any(|x| nests_deeper(x, levels - 1)),
         serde_json::Value::Array(a) => levels == 0 || a.iter().any(|x| nests_deeper(x, levels - 1)),
@@ -1978,7 +1987,7 @@ impl Client {
                 format!("the router prompt and this store's skills come to {stable} tokens, over {ROUTER_STABLE_MAX_TOKENS}"),
             ));
         }
-        let mut held: &[RouterExchange] = &exchanges;
+        let mut held: &[RouterExchange] = &exchanges[exchanges.len().saturating_sub(EXCHANGES_HELD)..];
         let call = loop {
             let turn = router_turn(held, clock, now_ms(), st.name.as_deref(), request);
             let bytes = turn.len() as u64;
@@ -2055,6 +2064,9 @@ impl Client {
                     format!("no function is registered for {} (RouterOptions.handlers)", def.name),
                 ));
             };
+            if run.expired() {
+                return Err(timed_out());
+            }
             return match run.within(f(input, ctx)).await {
                 None => Err(timed_out()),
                 Some(Ok(value)) => Ok((skill_text(&value), false)),

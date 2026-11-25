@@ -90,7 +90,10 @@ impl Client {
                     None => continue,
                     Some(None) => serde_json::Value::Null,
                     Some(Some(name)) if js_trim(name).is_empty() => {
-                        return Err(refused(format!("default_speakers.{side} must be a name, or Some(None) to clear it.")));
+                        return Err(refused(format!(
+                            "default_speakers.{side} must be a speaker's name (a non-blank string), or Some(None) to clear it, got {}.",
+                            js_quote(name)
+                        )));
                     }
                     Some(Some(name)) => serde_json::json!(written_speaker(name, &format!("default_speakers.{side}"))?),
                 };

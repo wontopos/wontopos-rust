@@ -63,6 +63,9 @@ impl Client {
         }
         check_metadata_keys(&metadata)?;
         let mut metadata = metadata;
+        if let Some(v) = metadata.get("speaker").filter(|v| !v.is_null() && !v.is_string()) {
+            return Err(refused(format!("speaker must be a speaker's name (a non-blank string), got {}.", js_json(v))));
+        }
         if let Some(who) = metadata.get("speaker").and_then(|s| s.as_str()).map(|s| written_speaker(s, "speaker")).transpose()? {
             metadata["speaker"] = serde_json::json!(who);
         }
@@ -319,8 +322,18 @@ impl Client {
         let mut obj = extra.as_object().cloned().unwrap_or_default();
         obj.insert("user_id".into(), serde_json::json!(user_id));
         obj.insert("query".into(), serde_json::json!(query));
+        // Every recall passes here, the plain one too: the lines it asks for when it is not told.
+        let told = matches!(obj.get("short_term_limit"), Some(v) if !v.is_null());
+        if !told {
+            // A null is no number given: it is not sent, as Python's None and TypeScript's null are not.
+            obj.remove("short_term_limit");
+            if WINDOW_MODELS.contains(&self.model.as_str()) {
+                obj.insert("short_term_limit".into(), serde_json::json!(RECENT_TURNS));
+            }
+        }
         let mut body = serde_json::Value::Object(obj);
         check_body_count(&body, "max_images", MAX_IMAGES_MAX)?;
+        check_body_count(&body, "short_term_limit", RECENT_TURNS_MAX)?;
         check_filters(&body)?;
         check_body_tz(&body)?;
         self.default_tz(&mut body);

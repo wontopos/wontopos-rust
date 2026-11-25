@@ -52,6 +52,40 @@
         assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
+    /// 2.2.54: the service's messages name HTTP paths; the client adds the call that does it here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_setup_refusal_names_the_call_that_fixes_it_here() {
+        let no_zone = "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"time_zone_required\",\"message\":\"this store has no time zone. \
+                       Set it once: POST /api/v1/memory/settings with this store's user_id. Nothing was stored.\"}}";
+        let no_speaker = "{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"speaker_required\",\"message\":\"from Scroll 2 a speaker \
+                          is required. Give metadata.speaker.\"}}";
+        let no_store = "{\"error\":{\"type\":\"not_found_error\",\"store\":\"alice\",\"message\":\"Store 'alice' does not exist in this API \
+                        key's workspace. Otherwise create it here: POST /api/v1/memory/collection.\"}}";
+        let no_memory = "{\"error\":{\"type\":\"not_found_error\",\"message\":\"Memory not found in this store.\"}}";
+        let (base, _seen) = scripted(vec![(400, no_zone), (400, no_speaker), (404, no_store), (404, no_memory)]);
+        let mem = Client::with_base_url(KEY, &base).with_retries(0);
+        let e = mem.add("x", "alice", json!({})).await.unwrap_err();
+        assert_eq!(e.code(), Some("time_zone_required"));
+        assert!(
+            e.to_string().ends_with(
+                "Nothing was stored. In this client: set_settings(user_id, &SettingsOpts { time_zone: Some(\"Asia/Seoul\".into()), ..Default::default() })."
+            ),
+            "{e}"
+        );
+        let e = mem.add("x", "alice", json!({})).await.unwrap_err();
+        assert!(
+            e.to_string().ends_with(
+                "Give metadata.speaker. In this client: register each name with add_speaker, then set_settings with default_speakers."
+            ),
+            "{e}"
+        );
+        let e = mem.search("q", "alice", 10).await.unwrap_err();
+        assert!(e.to_string().ends_with("In this client: create_store(\"alice\")."), "{e}");
+        // A 404 that is not about making a store says nothing of create_store.
+        let e = mem.get("alice", "m1").await.unwrap_err();
+        assert_eq!(e.to_string(), "[404] Memory not found in this store.");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn an_answer_that_starts_with_a_byte_order_mark_is_read_as_python_and_typescript_read_it() {
         let lock = "\u{feff}{\"type\":\"error\",\"error\":{\"type\":\"conflict_error\",\"message\":\"in flight\",\

@@ -282,7 +282,7 @@ async fn planted_instructions_meet_the_rules_as_the_fixture_says() {
         }
         if let Some(files) = scenario["before"].get("files").and_then(Value::as_object) {
             for (k, f) in files {
-                let body = text_of(&f["body"]);
+                let body = text_of(&expand(&f["body"]));
                 svc.lock().unwrap().slots[k.parse::<usize>().unwrap()].push(Version {
                     version: 1,
                     title: f.get("title").map(text_of).unwrap_or_default(),
@@ -641,11 +641,115 @@ fn the_texts_as_the_publish_gate_reads_them() {
         "_SLEEP_TIDY": SLEEP_TIDY,
         "_SLEEP_ROOM": SLEEP_ROOM,
         "_SLEEP_NOT_JSON": SLEEP_NOT_JSON,
+        "_SLEEP_ASKED_OUT": SLEEP_ASKED_OUT,
         "_SLEEP_READER_NOTE": SLEEP_READER_NOTE,
         "_SLEEP_OPEN_BOX": open_box_tool(),
         "_SLEEP_MANY_PEOPLE": {"digest": SLEEP_MANY_PEOPLE.digest, "merge": SLEEP_MANY_PEOPLE.merge},
     });
     if let Ok(path) = std::env::var("WONTOPOS_SLEEP_TEXTS") {
         std::fs::write(path, texts.to_string()).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_room_made_for_the_service_that_leaves_a_section_out_is_not_used() {
+    let fix = fix();
+    let (svc, mem, _) = served();
+    let core = "## Me\n- I am the assistant.\n\n## Dana\n- Dana likes green tea.\n";
+    let boxed = "## Dana\n- Dana moved to Busan.\n\n## Garden\n- The beans went in in May.\n\n## Trips\n- Busan in the spring.\n";
+    for (k, title, body) in [(0usize, "", core), (1usize, "People", boxed)] {
+        let mut s = svc.lock().unwrap();
+        s.slots[k].push(Version {
+            version: 1,
+            title: title.to_string(),
+            tokens: sleep_tokens(body) as i64,
+            body: body.to_string(),
+            evidence: json!([]),
+            day: Value::Null,
+            sleep_id: Value::Null,
+        });
+    }
+    {
+        let mut s = svc.lock().unwrap();
+        (s.scale, s.caps[1]) = (2, 30);
+    }
+    let night = json!({
+        "today": "2026-10-01 23:00",
+        "memories": [["user", "Notes were taken today."], ["being", "I wrote them down."], ["user", "More notes tomorrow."]],
+        "answers": {
+            "read": {"items": [], "mixed": []},
+            "merge": {"edits": [], "proposals": [], "notes": []},
+            "room": {"text": "## Garden\n- The beans went in in May."}
+        }
+    });
+    give(&svc, night_rows(0, &night));
+    let model = FixtureModel::new(&fix, &night["answers"], None);
+    let opts = SleepOpts { today: Some("2026-10-01 23:00".into()), settings: settings_of(&fix, &json!({})), ..Default::default() };
+    let slept = tokio::time::timeout(std::time::Duration::from_secs(30), mem.sleep("u", model.clone(), &opts)).await;
+    let res = slept.expect("the sleep ends").unwrap();
+    let svc = svc.lock().unwrap();
+    let writes: Vec<Vec<Value>> = svc
+        .seen
+        .iter()
+        .filter(|x| x.path.ends_with("/self/write"))
+        .map(|x| x.body["writes"].as_array().unwrap().iter().map(|w| w["slot"].clone()).collect())
+        .collect();
+    assert_eq!(json!(writes), json!([[1], [1]]));
+    let refused = res["refused"].as_array().unwrap();
+    assert_eq!(
+        json!(refused[refused.len() - 2..]),
+        json!([
+            {"edit": {"file": 1, "op": "room"},
+             "why": "no room: the service counts it over its cap, and the room made left out \"Trips\"; the file stays as it was"},
+            {"edit": {"file": 1, "op": "room"}, "why": "no room: the service counts it over its cap; the file stays as it was"}
+        ])
+    );
+    assert_eq!(res["rooms"], json!([{"file": 1, "before": res["rooms"][0]["before"], "after": null}]));
+    assert_eq!((svc.slots[1].len(), svc.slots[1][0].body.as_str()), (1, boxed));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_write_the_service_refuses_past_ten_times_ends_the_sleep_with_that_refusal() {
+    let fix = fix();
+    let (svc, mem, _) = served();
+    let stored = [(1usize, "## Garden\n- The beans went in in May.\n"), (2usize, "## Trips\n- Busan in the spring.\n")];
+    for (k, body) in stored {
+        let mut s = svc.lock().unwrap();
+        s.caps[k] = 1;
+        s.slots[k].push(Version {
+            version: 1,
+            title: format!("Box {k}"),
+            tokens: sleep_tokens(body) as i64,
+            body: body.to_string(),
+            evidence: json!([]),
+            day: Value::Null,
+            sleep_id: Value::Null,
+        });
+    }
+    let night = json!({
+        "today": "2026-10-01 23:00",
+        "memories": [["user", "Notes were taken today."], ["being", "I wrote them down."], ["user", "More notes tomorrow."]],
+        "answers": {
+            "read": {"items": [{"kind": "work", "topic": "Notes", "text": "Notes were taken.", "evidence": ["e1", "e3"]}], "mixed": []},
+            "merge": {"edits": [
+                {"file": "1", "op": "rewrite", "section": "Aaa", "text": "- one", "evidence": ["e1", "e3"]},
+                {"file": "1", "op": "move_section", "section": "Aaa", "to": "2"},
+                {"file": "2", "op": "rewrite", "section": "Bbb", "text": "- two", "evidence": ["e1", "e3"]},
+                {"file": "2", "op": "move_section", "section": "Bbb", "to": "1"}
+            ], "proposals": [], "notes": []}
+        }
+    });
+    give(&svc, night_rows(0, &night));
+    let model = FixtureModel::new(&fix, &night["answers"], None);
+    let opts = SleepOpts { today: Some("2026-10-01 23:00".into()), settings: settings_of(&fix, &json!({})), ..Default::default() };
+    let slept = tokio::time::timeout(std::time::Duration::from_secs(30), mem.sleep("u", model.clone(), &opts)).await;
+    let refused = slept.expect("the sleep ends").unwrap_err();
+    assert!(refused.to_string().contains("there is no room"), "{refused}");
+    let svc = svc.lock().unwrap();
+    let writes = svc.seen.iter().filter(|x| x.path.ends_with("/self/write")).count();
+    assert_eq!(writes, 11);
+    assert!(!svc.seen.iter().any(|x| x.path.ends_with("/sleep/done")));
+    for (k, body) in stored {
+        assert_eq!((svc.slots[k].len(), svc.slots[k][0].body.as_str()), (1, body));
     }
 }

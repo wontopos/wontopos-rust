@@ -150,6 +150,11 @@ pub(crate) const LIST_LIMIT_MIN: usize = 1;
 pub(crate) const LIST_LIMIT_MAX: usize = 500;
 pub(crate) const MAX_IMAGES_MAX: usize = 5;
 pub(crate) const VERIFY_MAX: usize = 3;
+/// How many lines of the recent conversation a call brings when it is not told: `recall` on a model that keeps
+/// a short-term window, and `memory_recent`. A caller sets 0 to 100.
+pub(crate) const RECENT_TURNS: usize = 50;
+pub(crate) const RECENT_TURNS_MAX: usize = 100;
+pub(crate) const WINDOW_MODELS: [&str; 1] = ["scroll-2"];
 pub(crate) fn check_search_limit(limit: usize) -> Result<(), WosError> {
     if !(SEARCH_LIMIT_MIN..=SEARCH_LIMIT_MAX).contains(&limit) {
         return Err(refused(format!(
@@ -333,8 +338,8 @@ pub(crate) fn check_instant(v: &str, name: &str) -> Result<String, WosError> {
 pub(crate) fn bulk_parts(content: Option<&str>, opts: &BulkOpts) -> Result<serde_json::Map<String, serde_json::Value>, WosError> {
     let mut out = serde_json::Map::new();
     match (content, &opts.segments) {
-        (Some(_), Some(_)) => return Err(refused("content and segments are exclusive: pass None as content to send segments.")),
-        (None, None) => return Err(refused("add_bulk_opts needs content or segments.")),
+        (Some(_), Some(_)) => return Err(refused("add_bulk_opts takes content or segments, not both: pass None as content to send segments.")),
+        (None, None) => return Err(refused("add_bulk_opts needs content, or segments: a list of segments (content, and optionally speaker and created_at).")),
         (Some(c), None) => {
             out.insert("content".into(), serde_json::json!(c));
             if let Some(who) = &opts.speaker {
@@ -343,15 +348,15 @@ pub(crate) fn bulk_parts(content: Option<&str>, opts: &BulkOpts) -> Result<serde
         }
         (None, Some(segments)) => {
             if opts.speaker.is_some() {
-                return Err(refused("speaker is for content: each segment names its own speaker."));
+                return Err(refused("speaker goes with content: with segments, each segment names its own speaker."));
             }
             if segments.is_empty() {
-                return Err(refused("segments must hold at least one segment."));
+                return Err(refused("segments must be a list of at least one segment (content, and optionally speaker and created_at)."));
             }
             let mut list = Vec::with_capacity(segments.len());
             for (i, s) in segments.iter().enumerate() {
                 if js_trim(&s.content).is_empty() {
-                    return Err(refused(format!("segments[{i}].content is required.")));
+                    return Err(refused(format!("segments[{i}].content is required: the text of that segment, not blank.")));
                 }
                 let mut one = serde_json::Map::new();
                 one.insert("content".into(), serde_json::json!(s.content));
@@ -476,7 +481,7 @@ pub(crate) fn recall_extra(opts: &RecallOpts) -> Result<serde_json::Map<String, 
         }
     }
     if let Some(n) = opts.short_term_limit {
-        extra.insert("short_term_limit".into(), serde_json::json!(check_range("short_term_limit", n, 0, 500)?));
+        extra.insert("short_term_limit".into(), serde_json::json!(check_range("short_term_limit", n, 0, RECENT_TURNS_MAX)?));
     }
     if let Some(n) = opts.short_term_budget_tokens {
         let n = check_range("short_term_budget_tokens", n, 0, 8_000)?;

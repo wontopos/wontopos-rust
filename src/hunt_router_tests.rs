@@ -195,6 +195,22 @@ fn lookup_skill() -> SkillDefinition {
 }
 
 #[tokio::test]
+async fn the_router_is_shown_the_newest_hundred_earlier_exchanges_however_many_the_service_sends() {
+    let many: Vec<Value> =
+        (0..5000).map(|i| json!({"request": format!("asked {i}"), "answer": format!("said {i}"), "at": "2026-10-01T00:00:00Z"})).collect();
+    let base = engine_with(Value::Array(many));
+    let rec = Recorder::new(Vec::new(), None);
+    let router = RouterOptions { router_caller: Some(rec.clone()), ..Default::default() };
+    let c = Client::with_base_url(KEY, &base).with_tz(9.0).unwrap().with_user("u").with_router(router).unwrap();
+    c.add_skill(lookup_skill(), None).await.unwrap();
+    let r = c.ask("q", None, &AskOpts::default()).await.unwrap();
+    assert!(r.ok, "{:?}", r.detail);
+    let user = &rec.calls()[0].user;
+    assert_eq!(user.matches("request: asked ").count(), 100);
+    assert!(user.contains("request: asked 4900\n") && !user.contains("request: asked 4899\n"));
+}
+
+#[tokio::test]
 async fn an_earlier_exchanges_time_outside_the_years_1_to_9999_shows_as_a_question_mark_and_an_early_year_has_four_digits() {
     let base = engine_with(json!([
         {"request": "far", "answer": "late", "at": "9999-12-31T23:59:59Z"},

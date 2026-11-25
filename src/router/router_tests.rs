@@ -609,6 +609,20 @@
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_clock_that_reads_an_earlier_date_does_not_start_a_stores_day_again() {
+        let e = engine();
+        let m = fake(|_, _| cannot());
+        let wos = client(&e, RouterOptions { limits: RouterLimits { per_day: Some(2), ..Default::default() }, ..both(&m) });
+        wos.add_skill(web(), None).await.unwrap();
+        let mut served = Vec::new();
+        for (i, tz) in [14.0, -12.0, 14.0, -12.0].into_iter().enumerate() {
+            served.push(wos.with_tz(tz).unwrap().ask("q", None, &turn(&i.to_string())).await.unwrap().ok);
+        }
+        assert_eq!(served, [true, true, false, false]);
+        assert_eq!(m.calls().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn the_deadline_a_model_that_does_not_answer_in_time_is_cut_off_and_its_call_dropped() {
         let e = engine();
         let m = fake(|_, _| Step::Never);
@@ -653,6 +667,35 @@
         assert_eq!(second.reason, Some(AskReason::Timeout));
         assert!(t0.elapsed() < Duration::from_millis(450), "the second ask got only what the first left ({:?})", t0.elapsed());
         assert!(fn_dropped.load(Ordering::SeqCst), "the function was dropped");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_code_function_is_not_started_once_the_asks_time_is_up() {
+        let e = engine();
+        let m = fake(|_, _| Step::Never);
+        let started = Arc::new(AtomicUsize::new(0));
+        let count = started.clone();
+        let records = skill_handler(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(json!("done")) }
+        });
+        let wos = client(&e, RouterOptions { handlers: handlers(vec![("add_event", records)]), ..both(&m) });
+        let ctx = |run: &super::AskClock| SkillContext {
+            store: "alice".into(),
+            request: String::new(),
+            note: String::new(),
+            ask_id: "a".into(),
+            speaker: None,
+            deadline: run.deadline(),
+        };
+        let over = super::AskClock::new(Duration::ZERO);
+        let ran = wos.run_skill_def(&event(), json!({"title": "x"}), ctx(&over), &over, &mut super::AskUsage::default()).await;
+        assert_eq!(ran.err().map(|f| f.reason), Some(AskReason::Timeout));
+        assert_eq!(started.load(Ordering::SeqCst), 0, "the function was not called");
+        let open = super::AskClock::new(Duration::from_secs(5));
+        let ran = wos.run_skill_def(&event(), json!({"title": "x"}), ctx(&open), &open, &mut super::AskUsage::default()).await;
+        assert!(ran.is_ok());
+        assert_eq!(started.load(Ordering::SeqCst), 1, "with time left it is called");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1480,6 +1523,11 @@
             let args = format!(r#"{{"request": "Fly me", "n": {n}}}"#);
             assert_eq!(tools.run_arguments("ask", &args).await.unwrap(), r#"{"ok":false,"text":"Refused: the arguments are not JSON."}"#, "{n}");
         }
+        let deep = (0..127).fold(json!({}), |v, _| json!({"a": v}));
+        assert_eq!(
+            tools.run("ask", &json!({"request": "Fly me", "n": deep})).await.unwrap(),
+            r#"{"ok":false,"text":"Refused: the arguments are not JSON."}"#
+        );
         assert!(err_text(tools.run("memory_search", &json!({})).await).contains("not the ask tool"));
         assert_eq!(m.calls().len(), 2);
         let bad = AskOpts { turn: Some(String::new()), ..Default::default() };

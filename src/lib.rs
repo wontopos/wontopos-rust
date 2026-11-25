@@ -49,6 +49,30 @@ const ENV_KEYS: [&str; 2] = ["WONTOPOS_API_KEY", "WOS_API_KEY"];
 const GONE_HINT: &str = "This model is retired; list_models() lists the ones you can use.";
 const ADMIN_ONLY: &str = "Only an admin key lists stores; this is a standard API key.";
 
+/// The call here for what the service's message names as an HTTP path: its text is written for every caller.
+fn setup_hint(status: u16, message: &str, code: Option<&str>) -> Option<String> {
+    match (status, code) {
+        (400, Some("time_zone_required")) => Some(
+            "In this client: set_settings(user_id, &SettingsOpts { time_zone: Some(\"Asia/Seoul\".into()), ..Default::default() })."
+                .into(),
+        ),
+        (400, Some("speaker_required")) => Some(
+            "In this client: register each name with add_speaker, then set_settings with default_speakers."
+                .into(),
+        ),
+        (404, _) if message.contains("POST /api/v1/memory/collection") => {
+            let named = message.strip_prefix("Store '").and_then(|rest| rest.split_once("' does not exist")).map(|(id, _)| id).filter(|id| {
+                (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            });
+            Some(match named {
+                Some(id) => format!("In this client: create_store({}).", js_quote(id)),
+                None => "In this client: create_store(user_id).".into(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Returned when a call gets no response, the API answers with a non-2xx status, or this client refuses the call or the answer.
 #[derive(Debug)]
 pub enum WosError {

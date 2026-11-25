@@ -136,7 +136,7 @@ pub struct RecallOpts {
     pub long_term_cutoff: Option<bool>,
     pub today_start: Option<String>,
     pub now: Option<String>,
-    /// Lines of the recent conversation, 0-500 (from Scroll 2 on; Tablet 2 ignores it).
+    /// Lines of the recent conversation, 0-100 (default 50 on a model that keeps a short-term window; from Scroll 2 on; Tablet 2 ignores it).
     pub short_term_limit: Option<usize>,
     /// Tokens of those lines, 0-8000; 0 sets no limit (from Scroll 2 on; Tablet 2 ignores it).
     pub short_term_budget_tokens: Option<u32>,

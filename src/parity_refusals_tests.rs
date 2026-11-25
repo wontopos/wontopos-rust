@@ -40,6 +40,15 @@ async fn rust_says(c: &Client, case: &str) -> Option<String> {
         "forget_speaker: no store" => said(c.forget_speaker(["A"], "", false).await),
         "by_speaker: empty" => said(c.by_speaker("", "u", None, None, None).await),
         "set_settings: nothing" => said(c.set_settings("u", &SettingsOpts::default()).await),
+        "add_bulk: content and segments" => said(c.add_bulk_opts("x", "u", "general", &segs(vec!["y"], None)).await),
+        "add_bulk: neither" => said(c.add_bulk_opts(None, "u", "general", &BulkOpts::default()).await),
+        "add_bulk: speaker with segments" => said(c.add_bulk_opts(None, "u", "general", &segs(vec!["y"], Some("Dana"))).await),
+        "add_bulk: no segments" => said(c.add_bulk_opts(None, "u", "general", &segs(vec![], None)).await),
+        "add_bulk: segment blank content" => said(c.add_bulk_opts(None, "u", "general", &segs(vec![" "], None)).await),
+        "set_settings: blank default speaker" => {
+            let who = DefaultSpeakers { user: Some(Some(" ".into())), ..Default::default() };
+            said(c.set_settings("u", &SettingsOpts { default_speakers: Some(who), ..Default::default() }).await)
+        }
         "open_work: empty question" => said(c.open_work("", "u", &LookOpts::default()).await),
         "open_work: diversity bad" => said(c.open_work("q", "u", &LookOpts { diversity: Some("lots".into()), ..Default::default() }).await),
         "open_work: max_images 99" => said(c.open_work("q", "u", &LookOpts { max_images: Some(99), ..Default::default() }).await),
@@ -60,8 +69,20 @@ async fn rust_says(c: &Client, case: &str) -> Option<String> {
 }
 
 /// The cases whose argument the signatures here take in another shape: a store or a count given as text, a fraction,
-/// and a time zone on one recall (set on the client here).
-const NOT_HERE: [&str; 4] = ["add: store not text", "search: limit 2.5", "search: limit text", "recall: tz 99"];
+/// a time zone on one recall (set on the client here), and a segment that is not a `Segment`.
+const NOT_HERE: [&str; 6] = [
+    "add: store not text",
+    "search: limit 2.5",
+    "search: limit text",
+    "recall: tz 99",
+    "add_bulk: segment not a dict",
+    "add_bulk: segment unknown key",
+];
+
+fn segs(texts: Vec<&str>, speaker: Option<&str>) -> BulkOpts {
+    let segments = texts.into_iter().map(|t| Segment { content: t.into(), ..Default::default() }).collect();
+    BulkOpts { segments: Some(segments), speaker: speaker.map(Into::into), ..Default::default() }
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn each_refusal_says_what_python_and_typescript_say() {
